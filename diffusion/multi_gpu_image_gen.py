@@ -1,16 +1,6 @@
 import torch
-import pytorch_lightning as pl
-import torch.nn as nn
-import torch.optim as optim
-from tqdm.auto import tqdm
-import nrrd
-import SimpleITK as sitk
-from diffusers import DDPMScheduler, UNet2DModel, DDIMScheduler
-import os
-import argparse
 import multiprocessing as mp
 from image_generation import image_generation
-import pandas as pd
 
 # rsync -a
 

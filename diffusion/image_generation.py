@@ -1,5 +1,5 @@
 import torch
-import pytorch_lightning as pl
+import lightning as l
 import torch.nn as nn
 import torch.optim as optim
 from tqdm.auto import tqdm
@@ -13,7 +13,7 @@ def init_world(data_path, num_inference_steps):
     # Set up device (GPU)
     device = torch.device("cuda")
 
-    class DiffusionModel(pl.LightningModule):
+    class DiffusionModel(l.LightningModule):
         def __init__(self, lr=1e-5, num_train_timesteps=1000):
             super().__init__()
             self.save_hyperparameters()  # log hyperparameters automatically
