@@ -59,8 +59,11 @@ class Generator(nn.Module):
                 if layer_id in [0, 4, 8, 12, 16]:
                     # print(layer_id, layer)
                     # print("F1", feat.shape)
-                    B, H, W = feat.shape[0], feat.shape[2], feat.shape[3]
-                    feat_reshape = feat.permute(0, 2, 3, 1).flatten(1, 2)
+                    B, H, W = feat.shape[0], feat.shape[2], feat.shape[3]                    
+                    if len(feat.shape) == 5:
+                        feat_reshape = feat.permute(0, 2, 3, 4, 1).flatten(1, 3)
+                    else:
+                        feat_reshape = feat.permute(0, 2, 3, 1).flatten(1, 2)
                     # print("F2", feat_reshape.shape)
                     if patch_ids is not None:
                         patch_id = patch_ids[mlp_id]

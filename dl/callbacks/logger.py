@@ -2335,3 +2335,52 @@ class USSegLoggerNeptune(Callback):
             }]
         )
         return fig
+    
+
+class Cut3DLogger(Callback):
+    def __init__(self, num_images=1, log_steps=100, *args, **kwargs):
+        self.log_steps = log_steps
+        self.num_images = num_images
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, unused=0):
+        
+        if batch_idx % self.log_steps == 0:
+            with torch.no_grad():
+
+                Y = batch
+                Y = pl_module.resize_t(Y)
+
+                max_num_image = min(Y.shape[0], self.num_images)
+                Y = Y[0:max_num_image]
+
+                X, tags = pl_module.volume_sampling(pl_module.diffusor_t, pl_module.diffusor_origin, pl_module.diffusor_end)
+                X = X[0][0:max_num_image]
+                X = pl_module.resize_t(X)
+
+                Y_fake = pl_module(X)
+                
+                X = torch.clip(X, min=0.0, max=1.0)
+                Y_fake = torch.clip(Y_fake, min=0.0, max=1.0)
+
+                X = X[0][0].unsqueeze(1)
+                Y_fake = Y_fake[0][0].unsqueeze(1)
+                Y = Y[0][0].unsqueeze(1)
+
+                grid_x = torchvision.utils.make_grid(X, nrow=8)
+
+                fig = plt.figure(figsize=(7, 9))
+                ax = plt.imshow(grid_x.permute(1, 2, 0).cpu().numpy())
+                trainer.logger.experiment["images/x"].upload(fig)
+                plt.close()
+
+                
+                grid_y_fake = torchvision.utils.make_grid(Y_fake, nrow=8)
+                fig = plt.figure(figsize=(7, 9))
+                ax = plt.imshow(grid_y_fake.permute(1, 2, 0).cpu().numpy())
+                trainer.logger.experiment["images/y_fake"].upload(fig)
+                plt.close()
+
+                grid_y = torchvision.utils.make_grid(Y, nrow=8)
+                fig = plt.figure(figsize=(7, 9))
+                ax = plt.imshow(grid_y.permute(1, 2, 0).cpu().numpy())
+                trainer.logger.experiment["images/y"].upload(fig)
+                plt.close()

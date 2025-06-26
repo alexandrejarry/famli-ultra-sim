@@ -71,50 +71,52 @@ class MergeGroup():
 
 
 def merge_groups(args, output_size, output_spacing, output_origin, out_dir):    
+
+    output_img_diffusor_fn = os.path.normpath(out_dir) + "_diffusor.nrrd"
+
+    if args.ow or not os.path.exists(output_img_diffusor_fn):
     
-    output_img_fn = os.path.normpath(out_dir) + ".nrrd"
-    out_np = np.zeros(output_size, dtype=np.ushort)
+        output_img_fn = os.path.normpath(out_dir) + ".nrrd"
+        out_np = np.zeros(output_size, dtype=np.ushort)
+        out_diffusor_np = np.random.normal(loc=args.b_mean, scale=args.b_std, size=output_size)
 
-    output_img_diffusor_fn = os.path.normpath(out_dir) + "_diffusor.nrrd"    
-    out_diffusor_np = np.random.normal(loc=args.b_mean, scale=args.b_std, size=output_size)
+        print("Merging groups...")
 
-    print("Merging groups...")
+        for g_name in args.group_order:
 
-    for g_name in args.group_order:
+            print(g_name)
+            g_image_fn = os.path.join(out_dir, g_name + ".nrrd")
+            g_img_np = sitk.GetArrayFromImage(sitk.ReadImage(g_image_fn))
 
-        print(g_name)
-        g_image_fn = os.path.join(out_dir, g_name + ".nrrd")
-        g_img_np = sitk.GetArrayFromImage(sitk.ReadImage(g_image_fn))
+            out_np[g_img_np > 0] = g_img_np[g_img_np > 0]
 
-        out_np[g_img_np > 0] = g_img_np[g_img_np > 0]
+            g_image_diffusor_fn = os.path.join(out_dir, g_name + "_diffusor.nrrd")
+            g_img_diffusor_np = sitk.GetArrayFromImage(sitk.ReadImage(g_image_diffusor_fn))
 
-        g_image_diffusor_fn = os.path.join(out_dir, g_name + "_diffusor.nrrd")
-        g_img_diffusor_np = sitk.GetArrayFromImage(sitk.ReadImage(g_image_diffusor_fn))
+            out_diffusor_np[g_img_np > 0] = g_img_diffusor_np[g_img_np > 0]    
 
-        out_diffusor_np[g_img_np > 0] = g_img_diffusor_np[g_img_np > 0]    
+        out_img = sitk.GetImageFromArray(out_np)
+        out_img.SetSpacing(output_spacing)
+        out_img.SetOrigin(output_origin)
 
-    out_img = sitk.GetImageFromArray(out_np)
-    out_img.SetSpacing(output_spacing)
-    out_img.SetOrigin(output_origin)
+        print(out_img)
+        
+        print("Writing:", output_img_fn)
+        writer = sitk.ImageFileWriter()
+        writer.SetFileName(output_img_fn)
+        writer.UseCompressionOn()
+        writer.Execute(out_img)
 
-    print(out_img)
-    
-    print("Writing:", output_img_fn)
-    writer = sitk.ImageFileWriter()
-    writer.SetFileName(output_img_fn)
-    writer.UseCompressionOn()
-    writer.Execute(out_img)
-
-    out_diffusor_np = np.clip(out_diffusor_np, a_min=args.a_min, a_max=args.a_max)
-    out_diffusor = sitk.GetImageFromArray(out_diffusor_np)
-    out_diffusor.SetSpacing(output_spacing)
-    out_diffusor.SetOrigin(output_origin)
-    
-    print("Writing:", output_img_diffusor_fn)
-    writer = sitk.ImageFileWriter()
-    writer.SetFileName(output_img_diffusor_fn)
-    writer.UseCompressionOn()
-    writer.Execute(out_diffusor)
+        out_diffusor_np = np.clip(out_diffusor_np, a_min=args.a_min, a_max=args.a_max)
+        out_diffusor = sitk.GetImageFromArray(out_diffusor_np)
+        out_diffusor.SetSpacing(output_spacing)
+        out_diffusor.SetOrigin(output_origin)
+        
+        print("Writing:", output_img_diffusor_fn)
+        writer = sitk.ImageFileWriter()
+        writer.SetFileName(output_img_diffusor_fn)
+        writer.UseCompressionOn()
+        writer.Execute(out_diffusor)
 
 def main(args):
     
@@ -229,6 +231,7 @@ if __name__ == "__main__":
     parser.add_argument('--a_min', type=float, help='Clip minimum value', default=None)
     parser.add_argument('--a_max', type=float, help='Clip maximum value', default=None)
     parser.add_argument('--n_proc', type=int, help='Max number of processes', default=None)
+    parser.add_argument('--ow', type=int, help='Overwrite', default=0)
 
     
     args = parser.parse_args()

@@ -17,7 +17,7 @@ class Discriminator(nn.Module):
             features *= 2
             layers += [
                 nn.Conv2d(features_prev, features, kernel_size=4, stride=1, padding=1) if not conv3d else nn.Conv3d(features_prev, features, kernel_size=4, stride=1, padding=1),
-                nn.InstanceNorm2d(features),
+                nn.InstanceNorm2d(features) if not conv3d else nn.InstanceNorm3d(features),
                 nn.LeakyReLU(0.2, True)
             ]
             features_prev = features

@@ -678,24 +678,49 @@ class SimuDataModule(LightningDataModule):
         return DataLoader(self.test_ds, batch_size=self.batch_size, num_workers=self.num_workers, persistent_workers=True, pin_memory=True, drop_last=self.drop_last)
 
 class USDataModuleBlindSweep(LightningDataModule):
-    def __init__(self, df_train, df_val, df_test, mount_point="./", batch_size=256, num_workers=4, num_frames=50, max_sweeps=-1, img_column='uuid_path', ga_column=None, id_column=None, train_transform=None, valid_transform=None, test_transform=None, drop_last=False):
+    def __init__(self, **kwargs):
         super().__init__()
 
-        self.df_train = df_train
-        self.df_val = df_val
-        self.df_test = df_test
-        self.mount_point = mount_point
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.img_column = img_column
-        self.ga_column = ga_column
-        self.id_column = id_column
-        self.num_frames = num_frames
+        # df_train, df_val, df_test, mount_point="./", batch_size=256, num_workers=4, num_frames=50, max_sweeps=-1, img_column='uuid_path', ga_column=None, id_column=None, train_transform=None, valid_transform=None, test_transform=None, drop_last=False
+
+        self.save_hyperparameters(logger=False)
+
+        self.df_train = pd.read_csv(self.hparams.csv_train)
+        self.df_val = pd.read_csv(self.hparams.csv_valid)
+        self.df_test = pd.read_csv(self.hparams.csv_test)
+
+        
+        self.mount_point = self.hparams.mount_point
+        self.batch_size = self.hparams.batch_size
+        self.num_workers = self.hparams.num_workers
+        self.img_column = self.hparams.img_column
+        self.ga_column = self.hparams.ga_column
+        self.id_column = self.hparams.id_column
+        self.num_frames = self.hparams.num_frames
         self.train_transform = train_transform
         self.valid_transform = valid_transform
         self.test_transform = test_transform
-        self.drop_last=drop_last
-        self.max_sweeps = max_sweeps
+        self.drop_last = self.hparams.drop_last
+        self.max_sweeps = self.hparams.max_sweeps
+
+    @staticmethod
+    def add_data_specific_args(parent_parser):
+
+        group = parent_parser.add_argument_group("USDataModuleBlindSweep")
+        
+        group.add_argument('--mount_point', type=str, default="./")
+        group.add_argument('--batch_size', type=int, default=8)
+        group.add_argument('--num_workers', type=int, default=6)
+        group.add_argument('--img_column', type=str, default="img")
+        group.add_argument('--ga_column', type=str, default=None)
+        group.add_argument('--id_column', type=str, default=None)
+        group.add_argument('--csv_train', type=str, default=None, required=True)
+        group.add_argument('--csv_valid', type=str, default=None, required=True)
+        group.add_argument('--csv_test', type=str, default=None, required=True)
+        
+        group.add_argument('--drop_last', type=int, default=False)
+
+        return parent_parser
 
     def setup(self, stage=None):
 
@@ -1417,43 +1442,45 @@ class DiffusorDataModule(LightningDataModule):
         return DataLoader(self.val_ds, batch_size=self.batch_size, num_workers=self.num_workers, drop_last=self.drop_last)
 
 class DiffusorSampleDataset(Dataset):
-    def __init__(self, df, mount_point = "./", img_column='img_path', transform=None, num_samples=1000, return_ridx=False):
+    def __init__(self, df, mount_point = "./", img_column='img_path', transform=None, num_samples=None, return_ridx=False):
         self.df = df
         
         self.mount_point = mount_point        
         self.transform = transform
         self.img_column = img_column
-        self.num_samples = num_samples
+        self.use_random_samples = False
+        if num_samples is None:
+            self.num_samples = len(self.df.index)
+        else:
+            self.num_samples = num_samples
+            self.use_random_samples = True
         self.return_ridx = return_ridx        
 
         self.buffer = []
         for idx in range(len(self.df.index)):
             img_path = os.path.join(self.mount_point, self.df.iloc[idx][self.img_column])
 
-            diffusor_np, diffusor_head = nrrd.read(img_path)            
-            diffusor_size = diffusor_head['sizes']
-            diffusor_spacing = np.diag(diffusor_head['space directions'])
-
-            diffusor_origin = np.flip(diffusor_head['space origin'], axis=0)
+            diffusor = sitk.ReadImage(img_path)
+            diffusor_t = torch.tensor(sitk.GetArrayFromImage(diffusor).astype(int))
+            diffusor_size = torch.tensor(diffusor.GetSize())
+            diffusor_spacing = torch.tensor(diffusor.GetSpacing())
+            diffusor_origin = torch.tensor(diffusor.GetOrigin())
             diffusor_end = diffusor_origin + diffusor_spacing * diffusor_size
 
-            diffusor_arr = [diffusor_np, diffusor_origin, diffusor_end]
-
-            self.buffer.append(diffusor_arr)
-
+            self.buffer.append([diffusor_t, diffusor_origin, diffusor_end])
 
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, idx):
-        r_idx = random.randint(0, len(self.buffer)-1)
-        diffusor_np, diffusor_origin, diffusor_end = self.buffer[r_idx] 
-        diffusor_t = torch.tensor(diffusor_np.copy().astype(int)).permute(2, 1, 0)     
+        if self.use_random_samples:
+            idx = random.randint(0, len(self.buffer)-1)
+        diffusor_t, diffusor_origin, diffusor_end = self.buffer[idx] 
         if self.transform:
             diffusor_t = self.transform(diffusor_t)            
         if self.return_ridx:
-            return diffusor_t, torch.tensor(diffusor_origin.copy()), torch.tensor(diffusor_end.copy()), torch.tensor(r_idx)
-        return diffusor_t, torch.tensor(diffusor_origin.copy()), torch.tensor(diffusor_end.copy())
+            return diffusor_t, diffusor_origin, diffusor_end, torch.tensor(idx)
+        return diffusor_t, diffusor_origin, diffusor_end
     
 class DiffusorSampleDataModule(LightningDataModule):
     def __init__(self, **kwargs):
@@ -2056,3 +2083,149 @@ class CutDataModuleV2(LightningDataModule):
 
     def test_dataloader(self):
         return DataLoader(self.test_ds, batch_size=1, num_workers=self.hparams.num_workers, collate_fn=self.collate_all)
+    
+class USButterflyBlindSweep(Dataset):
+    def __init__(self, df, mount_point = "./", img_column='img_path', transform=None, num_frames=-1, continous_frames=False):
+        self.df = df
+        self.mount_point = mount_point
+        self.transform = transform
+        self.img_column = img_column
+        self.keys = self.df.index
+        self.num_frames = num_frames
+        self.continous_frames = continous_frames 
+
+    def __len__(self):
+        return len(self.keys)
+
+    def __getitem__(self, idx):
+        
+        img_path = os.path.join(self.mount_point, self.df.iloc[idx][self.img_column])
+
+        try:
+            img = sitk.ReadImage(img_path)
+            img_np = sitk.GetArrayFromImage(img)
+            img_t = torch.tensor(img_np, dtype=torch.float32)
+            
+            if img.GetNumberOfComponentsPerPixel() == 1:
+                img_t = img_t.unsqueeze(-1)
+            
+            img_t = img_t.permute(3, 0, 1, 2)/255.0  # Change to (C, D, H, W)             
+            
+            if self.num_frames > 0:
+
+                if self.continous_frames:
+                    if img_t.shape[1] <= self.num_frames:
+                        # pad with zeros if the number of frames is less than num_frames
+                        pad_size = self.num_frames - img_t.shape[1]
+                        img_t = torch.nn.functional.pad(img_t, (0, 0, 0, 0, 0, pad_size), mode='constant', value=0.0)
+                        idx = torch.arange(0, self.num_frames)
+                    else:
+                        idx = torch.randint(low=0, high=img_t.shape[1] - self.num_frames, size=(1,)).item()
+                        idx = torch.arange(idx, idx + self.num_frames)
+                else:
+                    idx = torch.randint(low=0, high=img_t.shape[1], size=self.num_frames)
+                    idx = idx.sort().values
+
+                img_t = img_t[:, idx, :, :]
+                    
+        except:
+            print("Error reading cine: " + img_path)
+            n = self.num_frames if self.num_frames > 0 else 1
+            img_t = torch.zeros(1, n, 256, 256, dtype=torch.float32)
+
+        if self.transform:
+            img_t = self.transform(img_t)
+
+        return img_t
+    
+class USButterflyBlindSweepDataModule(LightningDataModule):
+    def __init__(self, **kwargs):
+        super().__init__()
+
+        self.save_hyperparameters(logger=False)
+
+        self.df_train = pd.read_csv(self.hparams.csv_train)
+        self.df_val = pd.read_csv(self.hparams.csv_valid)
+
+        self.train_transform = None
+        self.valid_transform = None
+
+    @staticmethod
+    def add_data_specific_args(parent_parser):
+
+        group = parent_parser.add_argument_group("USButterflyBlindSweepDataModule")
+        group.add_argument('--batch_size', type=int, default=2)
+        group.add_argument('--num_workers', type=int, default=6)
+        group.add_argument('--num_frames', type=int, default=64)
+        group.add_argument('--continous_frames', type=int, default=1)
+        group.add_argument('--img_column', type=str, default="img")
+        group.add_argument('--csv_train', type=str, default=None, required=True)
+        group.add_argument('--csv_valid', type=str, default=None, required=True)
+        group.add_argument('--mount_point', type=str, default="./")
+        group.add_argument('--drop_last', type=int, default=0)
+        group.add_argument('--collate_batch', type=int, default=0)
+
+        return parent_parser
+        
+    
+    def setup(self, stage=None):
+        # Assign train/val datasets for use in dataloaders
+        self.train_ds = USButterflyBlindSweep(self.df_train, self.hparams.mount_point, img_column=self.hparams.img_column, transform=self.train_transform, num_frames=self.hparams.num_frames, continous_frames=True)
+        self.val_ds = USButterflyBlindSweep(self.df_val, self.hparams.mount_point, img_column=self.hparams.img_column, transform=self.valid_transform, num_frames=self.hparams.num_frames, continous_frames=True)
+    
+    def collate_batch(self, batch):
+        return torch.cat(batch, dim=1).permute(1, 0, 2, 3) # Change to (B, C, H, W)
+
+    def train_dataloader(self):
+        return DataLoader(self.train_ds, batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers, persistent_workers=True, pin_memory=True, drop_last=bool(self.hparams.drop_last), shuffle=True, prefetch_factor=2, collate_fn=self.collate_batch if self.hparams.collate_batch else None)
+    def val_dataloader(self):
+        return DataLoader(self.val_ds, batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers, drop_last=bool(self.hparams.drop_last), prefetch_factor=2, collate_fn=self.collate_batch if self.hparams.collate_batch else None)
+    
+class Cut3DDataModule(LightningDataModule):
+    def __init__(self, **kwargs):
+        super().__init__()
+
+        self.save_hyperparameters(logger=False)
+
+        self.df_train_diffusor = pd.read_csv(self.hparams.csv_train_diffusor)
+        self.df_val_diffusor = pd.read_csv(self.hparams.csv_valid_diffusor)
+        self.df_train = pd.read_csv(self.hparams.csv_train)
+        self.df_val = pd.read_csv(self.hparams.csv_valid)
+
+        self.train_transform = None
+        self.valid_transform = None
+
+    @staticmethod
+    def add_data_specific_args(parent_parser):
+
+        group = parent_parser.add_argument_group("Cut3DDataModule")
+        group.add_argument('--batch_size', type=int, default=2)
+        group.add_argument('--num_workers', type=int, default=6)
+        group.add_argument('--num_frames', type=int, default=128)        
+        group.add_argument('--img_column_diffusor', type=str, default="img")
+        group.add_argument('--csv_train_diffusor', type=str, default=None, required=True)
+        group.add_argument('--csv_valid_diffusor', type=str, default=None, required=True)
+        group.add_argument('--img_column', type=str, default="file_path")
+        group.add_argument('--csv_train', type=str, default=None, required=True)
+        group.add_argument('--csv_valid', type=str, default=None, required=True)
+        group.add_argument('--mount_point', type=str, default="./")
+        group.add_argument('--drop_last', type=int, default=0)
+
+        return parent_parser
+    
+    def setup(self, stage=None):
+        # Assign train/val datasets for use in dataloaders
+
+        train_diff_ds = DiffusorSampleDataset(self.df_train_diffusor, self.hparams.mount_point, img_column=self.hparams.img_column_diffusor)
+        val_diff_ds = DiffusorSampleDataset(self.df_val_diffusor, self.hparams.mount_point, img_column=self.hparams.img_column_diffusor)
+
+        train_butterfly_ds = USButterflyBlindSweep(self.df_train, self.hparams.mount_point, img_column=self.hparams.img_column, num_frames=self.hparams.num_frames, continous_frames=True)
+        val_butterfly_ds = USButterflyBlindSweep(self.df_val, self.hparams.mount_point, img_column=self.hparams.img_column, num_frames=self.hparams.num_frames, continous_frames=True)
+
+        self.train_ds = ConcatDataset(train_diff_ds, train_butterfly_ds)
+        self.val_ds = ConcatDataset(val_diff_ds, val_butterfly_ds)
+    
+    def train_dataloader(self):
+        return DataLoader(self.train_ds, batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers, persistent_workers=True, pin_memory=True, drop_last=self.hparams.drop_last, shuffle=True, prefetch_factor=2)
+    def val_dataloader(self):
+        return DataLoader(self.val_ds, batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers, drop_last=self.hparams.drop_last, prefetch_factor=2)

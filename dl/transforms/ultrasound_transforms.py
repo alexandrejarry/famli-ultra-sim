@@ -1,9 +1,10 @@
 
 import math
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torchvision import transforms
-from torchvision.transforms import functional as F
+from torchvision.transforms import functional as VF
 
 # from pl_bolts.transforms.dataset_normalizations import (
 #     imagenet_normalization
@@ -736,9 +737,9 @@ class Transpose:
             PIL Image: Transformed image.
         """
         # Rotate the image by 90 degrees
-        rotated_img = F.rotate(img, -90, expand=True)
+        rotated_img = VF.rotate(img, -90, expand=True)
         # Flip the rotated image horizontally
-        transposed_img = F.hflip(rotated_img)
+        transposed_img = VF.hflip(rotated_img)
         return transposed_img
 
     def __repr__(self):
@@ -951,12 +952,12 @@ class PadAndCrop:
         :return: Padded and cropped image. (padding_left,padding_right, padding_top,padding_bottom)padding_top,padding_bottom)
         """
         # Pad the image
-        img_padded = F.pad(img, (0, self.pad_bottom, 0, self.pad_height), padding_mode='constant', fill=0)
+        img_padded = VF.pad(img, (0, self.pad_bottom, 0, self.pad_height), padding_mode='constant', fill=0)
         _, _, h, w = img.shape
         
         # return img_padded
         
-        return F.crop(img_padded, top=self.pad_height, left=0, height=h, width= w) 
+        return VF.crop(img_padded, top=self.pad_height, left=0, height=h, width= w) 
         
 class LotusTrainTransforms:
     def __init__(self, height: int = 256):
@@ -995,11 +996,12 @@ class LotusEvalTransforms:
         return self.eval_transform(inp)
     
 class VolumeSlicingTrainTransforms:
-    def __init__(self, height: int = 256):
+    def __init__(self, spatial_size: tuple = (-1, -1, -1)):
 
         # image augmentation functions
         self.train_transform = Compose(
             [   
+                Resize(spatial_size=spatial_size, mode='nearest'),
                 RandRotate(range_x=math.pi, mode='nearest', prob=1.0, padding_mode='zeros'),
                 RandAffine(prob=0.5, shear_range=(0.1, 0.1), mode='nearest', padding_mode='zeros'),
                 RandAxisFlip(prob=0.5),
@@ -1155,3 +1157,165 @@ class FluidEvalTransforms:
 
     def __call__(self, inp):
         return self.eval_transform(inp)
+    
+class RandomRotation3D:
+    def __init__(self, max_angle=180, mode='nearest'):
+        """
+        Initialize the random rotation transform.
+
+        Args:
+            max_angle (int): Maximum rotation angle in degrees for each axis.
+        """
+        self.max_angle = max_angle
+        self.mode = mode
+
+    def get_random_rotation_matrix(self, device):
+        """Generate a random 3D rotation matrix (angle in degrees)."""
+        angles = torch.rand(3, device=device) * 2 * self.max_angle - self.max_angle
+        angles = angles * torch.pi / 180.0  # to radians
+
+        cx, cy, cz = torch.cos(angles)
+        sx, sy, sz = torch.sin(angles)
+
+        Rx = torch.tensor([
+            [1, 0, 0],
+            [0, cx, -sx],
+            [0, sx, cx]
+        ], device=device)
+
+        Ry = torch.tensor([
+            [cy, 0, sy],
+            [0, 1, 0],
+            [-sy, 0, cy]
+        ], device=device)
+
+        Rz = torch.tensor([
+            [cz, -sz, 0],
+            [sz, cz, 0],
+            [0, 0, 1]
+        ], device=device)
+
+        return Rz @ Ry @ Rx  # Combined rotation
+
+    def rotate_3d_tensor(self, x):
+        """
+        Rotate a 3D tensor [B, C, D, H, W] with independent random rotations.
+        """
+        device = x.device
+        B, C, D, H, W = x.shape
+
+        # Create a batch of affine matrices
+        affines = []
+        for _ in range(B):
+            R = self.get_random_rotation_matrix(device)
+            A = torch.eye(4, device=device)
+            A[:3, :3] = R
+            affines.append(A[:3])  # [3, 4]
+
+        affines = torch.stack(affines, dim=0)  # [B, 3, 4]
+
+        # Create grid for each sample in the batch
+        grid = F.affine_grid(affines, size=x.shape, align_corners=True)  # [B, D, H, W, 3]
+
+        rotated = F.grid_sample(x, grid, mode=self.mode, padding_mode='zeros', align_corners=True)
+        return rotated
+
+    def __call__(self, x):
+        return self.rotate_3d_tensor(x)
+    
+class RandomScale3D:
+    def __init__(self, scale_range=(0.9, 1.1)):
+        """
+        Initialize the random scale transform.
+
+        Args:
+            scale_range (tuple): Min and max scale factor for each axis.
+        """
+        self.scale_range = scale_range
+
+    def get_random_scale_matrix(self, device):
+        """
+        Generate a random 3D scaling matrix.
+
+        Returns:
+            torch.Tensor: [3, 3] scaling matrix
+        """
+        scales = torch.empty(3, device=device).uniform_(*self.scale_range)
+        S = torch.diag(scales)
+        return S
+
+    def scale_3d_tensor(self, x):
+        """
+        Scale a 3D tensor [B, C, D, H, W] with random scaling.
+
+        Returns:
+            torch.Tensor: Scaled tensor [B, C, D, H, W]
+        """
+        device = x.device
+        B, C, D, H, W = x.shape
+
+        # Create batch of affine scale matrices
+        affines = []
+        for _ in range(B):
+            S = self.get_random_scale_matrix(device)
+            A = torch.eye(4, device=device)
+            A[:3, :3] = S
+            affines.append(A[:3])  # [3, 4]
+
+        affines = torch.stack(affines, dim=0)  # [B, 3, 4]
+
+        # Create grid and sample
+        grid = F.affine_grid(affines, size=x.shape, align_corners=False)  # [B, D, H, W, 3]
+        scaled = F.grid_sample(x, grid, mode='bilinear', padding_mode='border', align_corners=False)
+        return scaled
+
+    def __call__(self, x):
+        return self.scale_3d_tensor(x)
+    
+
+class Resize3D:
+    def __init__(self, target_size, mode='nearest'):
+        """
+        Resize a 3D tensor [B, C, D, H, W] to the target size.
+
+        Args:
+            target_size (tuple): (D, H, W), use -1 to keep that dimension unchanged
+        """
+        assert len(target_size) == 3, "target_size must be a tuple of (D, H, W)"
+        self.target_size = target_size
+        self.mode = mode
+
+    def __call__(self, x):
+        """
+        Resize the input tensor.
+
+        Args:
+            x (torch.Tensor): [B, C, D, H, W]
+
+        Returns:
+            torch.Tensor: resized tensor [B, C, D', H', W']
+        """
+        assert x.ndim == 5, "Input tensor must have shape [B, C, D, H, W]"
+        B, C, D, H, W = x.shape
+
+        out_D = self.target_size[0] if self.target_size[0] != -1 else D
+        out_H = self.target_size[1] if self.target_size[1] != -1 else H
+        out_W = self.target_size[2] if self.target_size[2] != -1 else W
+
+        resized = F.interpolate(x, size=(out_D, out_H, out_W), mode=self.mode)
+        return resized
+    
+class DiffusorTrainTransform:
+    def __init__(self, target_size: tuple = (-1, -1, -1)):
+
+        # image augmentation functions
+        self.train_transform = transforms.Compose(
+            [
+                Resize3D(target_size=target_size, mode='nearest'),
+                RandomRotation3D(max_angle=180, mode='nearest'),
+                RandomScale3D(scale_range=(0.5, 1.25)),
+            ]
+        )
+
+    def __call__(self, inp):
+        return self.train_transform(inp)

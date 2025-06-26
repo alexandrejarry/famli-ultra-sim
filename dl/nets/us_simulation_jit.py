@@ -5,6 +5,10 @@ import torch.nn.functional as F
 from torchvision import transforms as T
 from . import cut
 from . import diffusion
+from .lotus import UltrasoundRenderingLinear
+import argparse
+import numpy as np
+import pandas as pd
 
 class MergedCut3(nn.Module):
     def __init__(self):
@@ -796,18 +800,27 @@ class MergedGuidedLabel11(MergedLinearLabel11):
             mask_fan = self.USR.mask_fan
         X, z_mu, z_sigma = self.au(X)
         return X*mask_fan
-    
-class MergedLinearLabel11WOG(MergedLinearLabel11):
+
+class MergedGuidedAnim(MergedLinearLabel11):
     def __init__(self):
         super().__init__()
 
+        self.USR = UltrasoundRenderingLinear(num_labels=333, grid_w=256, grid_h=256, center_x=128.0, center_y=-30.0, r1=20.0, r2=215.0, theta=np.pi/4.0)
+        df = pd.read_csv('/mnt/raid/C1_ML_Analysis/simulated_data_export/animation_export/shapes_intensity_map_nrrd.csv')
+        self.USR.init_params(torch.tensor(df['mean']), torch.tensor(df['stddev']))
+
     def forward(self, X, grid=None, inverse_grid=None, mask_fan=None):
         X = self.USR(X, grid, inverse_grid, mask_fan)
-
         if mask_fan is None:
             mask_fan = self.USR.mask_fan
-            
-        X = self.transform_us(X*mask_fan)
+        return X*mask_fan
 
-
-
+class CutLabel3D(MergedGuidedAnim):
+    def __init__(self):
+        super().__init__()
+        self.model_cut = cut.CutLabel.load_from_checkpoint("/mnt/raid/C1_ML_Analysis/train_output/Cut3d/0.1", num_labels=12)
+        self.model_cut.freeze()
+        self.USR = self.model_cut.USR
+        self.G = self.model_cut.G
+        # model_fn = "/mnt/raid/C1_ML_Analysis/train_output/diffusionAE/extract_frames_Dataset_C_masked_resampled_256_spc075_wscores_meta_BPD01_MACFL025-7mo-9mo/v0.4/epoch=72-val_loss=0.01.ckpt"
+        # self.AE = diffusion.AutoEncoderKL.load_from_checkpoint(model_fn)

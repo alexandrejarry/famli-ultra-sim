@@ -3,66 +3,23 @@ from torch import nn
 import torch.optim as optim
 import torch.nn.functional as F
 import functools
-import torchvision 
-
-import pytorch_lightning as pl
-
-import torchmetrics
-
 
 from generative.losses.adversarial_loss import PatchAdversarialLoss
 from generative.losses.perceptual import PerceptualLoss
 from generative.networks import nets
-from generative.networks.schedulers import DDPMScheduler, DDIMScheduler
-from generative.inferers import LatentDiffusionInferer, DiffusionInferer
 from generative.networks.nets import PatchDiscriminator
-
-from .lotus import UltrasoundRendering, UltrasoundRenderingLinear
-import numpy as np 
 from generative.losses import PatchAdversarialLoss, PerceptualLoss
-from torchvision import transforms as T
-
-from torch.nn.modules.loss import _Loss
-from monai.utils import LossReduction
 
 
+from diffusers import DDPMScheduler, UNet2DModel
 
+import lightning as L
+from lightning.pytorch.core import LightningModule
+from transforms import ultrasound_transforms as ust 
 
-import monai
-from monai import transforms
+from typing import Union
 
-class GaussianNoise(nn.Module):    
-    def __init__(self, mean=0.0, std=0.05):
-        super(GaussianNoise, self).__init__()
-        self.mean = torch.tensor(mean)
-        self.std = torch.tensor(std)
-    def forward(self, x):
-        if self.training:
-            return x + torch.normal(mean=self.mean, std=self.std, size=x.size(), device=x.device)
-        return x
-    
-class RandCoarseShuffle(nn.Module):    
-    def __init__(self, prob=0.75, holes=16, spatial_size=32):
-        super(RandCoarseShuffle, self).__init__()
-        self.t = transforms.RandCoarseShuffle(prob=prob, holes=holes, spatial_size=spatial_size)
-    def forward(self, x):
-        if self.training:
-            return self.t(x)
-        return x
-
-class SaltAndPepper(nn.Module):    
-    def __init__(self, prob=0.05):
-        super(SaltAndPepper, self).__init__()
-        self.prob = prob
-    def __call__(self, x):
-        noise_tensor = torch.rand(x.shape)
-        salt = torch.max(x)
-        pepper = torch.min(x)
-        x[noise_tensor < self.prob/2] = salt
-        x[noise_tensor > 1-self.prob/2] = pepper
-        return x
-
-class AutoEncoderKL(pl.LightningModule):
+class AutoEncoderKL(LightningModule):
     def __init__(self, **kwargs):
         super().__init__()
         self.save_hyperparameters()
@@ -117,18 +74,10 @@ class AutoEncoderKL(pl.LightningModule):
 
         if hasattr(self.hparams, "denoise") and self.hparams.denoise: 
             self.noise_transform = torch.nn.Sequential(
-                GaussianNoise(0.0, 0.05),
-                RandCoarseShuffle(),
-                SaltAndPepper()
+                ust.GaussianNoise(0.0, 0.05)
             )
         else:
             self.noise_transform = nn.Identity()
-
-        if hasattr(self.hparams, "smooth") and self.hparams.smooth: 
-            self.smooth_transform = transforms.RandSimulateLowResolution(prob=1.0, zoom_range=(0.15, 0.3))
-        else:
-            self.smooth_transform = nn.Identity()
-        
         
 
     def configure_optimizers(self):
@@ -206,1866 +155,1091 @@ class AutoEncoderKL(pl.LightningModule):
         return self.autoencoderkl(images)
 
 
-class AutoEncoderKLPaired(pl.LightningModule):
+
+class DiffusionModel(LightningModule):
     def __init__(self, **kwargs):
         super().__init__()
         self.save_hyperparameters()
-
-        latent_channels = 3
-        if hasattr(self.hparams, "latent_channels"):
-            latent_channels = self.hparams.latent_channels
-
-        self.autoencoderkl = nets.AutoencoderKL(
-            spatial_dims=2,
-            in_channels=1,
-            out_channels=1,
-            num_channels=(128, 128, 256),
-            latent_channels=latent_channels,
-            num_res_blocks=2,
-            attention_levels=(False, False, False),
-            with_encoder_nonlocal_attn=False,
-            with_decoder_nonlocal_attn=False,
+        self.net = UNet2DModel(
+            in_channels=self.hparams.in_channels,  # the number of input channels, 3 for RGB images
+            out_channels=self.hparams.out_channels,  # the number of output channels
+            layers_per_block=self.hparams.layers_per_block,  # how many ResNet layers to use per UNet block
+            block_out_channels=self.hparams.block_out_channels,  # the number of output channes for each UNet block
+            down_block_types=self.hparams.down_block_types,  # the types of blocks to use in the downsampling part of the UNet
+            up_block_types=self.hparams.up_block_types,
         )
+        self.scheduler = DDPMScheduler(num_train_timesteps=self.hparams.num_train_timesteps, beta_schedule="linear")
+        self.loss_fn = nn.MSELoss()
 
-        self.perceptual_loss = PerceptualLoss(spatial_dims=2, network_type="alex")
+        self.resize = ust.Resize2D(self.hparams.image_size)
 
-        self.automatic_optimization = False
+    @staticmethod
+    def add_model_specific_args(parent_parser):
 
-        self.discriminator = nets.PatchDiscriminator(spatial_dims=2, num_layers_d=3, num_channels=64, in_channels=1, out_channels=1)        
+        hparams_group = parent_parser.add_argument_group('DiffusionModel Hugging Face')
+        hparams_group.add_argument('--lr', default=1e-4, type=float, help='Learning rate generator')
+        hparams_group.add_argument('--num_train_timesteps', default=1000, type=int, help='Number of training timesteps')
+        hparams_group.add_argument('--in_channels', default=1, type=int, help='Number of input channels')
+        hparams_group.add_argument('--out_channels', default=1, type=int, help='Number of output channels')
+        hparams_group.add_argument('--layers_per_block', default=2, type=int, help='Number of layers per block')
+        hparams_group.add_argument('--block_out_channels', default=(128, 128, 256, 256, 512, 512), nargs='+', type=int, help='Block out channels')
+        hparams_group.add_argument('--down_block_types', default=("DownBlock2D", "DownBlock2D", "DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "DownBlock2D"), nargs='+', type=str, help='Down block types')
+        hparams_group.add_argument('--up_block_types', default=("UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D", "UpBlock2D", "UpBlock2D"), nargs='+', type=str, help='Up block types')
+        hparams_group.add_argument('--image_size', default=(128, 128), type=int, nargs='+', help='Image size')
 
-        self.adversarial_loss = PatchAdversarialLoss(criterion="least_squares")        
-
-        self.noise_transform = torch.nn.Sequential(
-            GaussianNoise(0.0, 0.05),
-            RandCoarseShuffle(),
-            SaltAndPepper()
-            
-        )
+        return parent_parser
         
+
+    def forward(self, x, timesteps):
+        return self.net(x, timesteps).sample
+
+    def training_step(self, batch, batch_idx):
+        x = batch  
+
+        x = self.resize(x)
+        timesteps = torch.randint(0, self.scheduler.config.num_train_timesteps, (x.size(0),), device=self.device).long()
+        noise = torch.randn_like(x).to(self.device)
+        noisy_images = self.scheduler.add_noise(x, noise, timesteps)
+
+        pred = self(noisy_images, timesteps)  # Model forward pass
+        loss = self.loss_fn(pred, noise)
+
+        self.log("train_loss", loss)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x = batch  
+        x = self.resize(x)
+        timesteps = torch.randint(0, self.scheduler.config.num_train_timesteps, (x.size(0),), device=self.device).long()
+        noise = torch.randn_like(x).to(self.device)
+        noisy_images = self.scheduler.add_noise(x, noise, timesteps)
+
+        pred = self(noisy_images, timesteps)  # Model forward pass
+        loss = self.loss_fn(pred, noise)
+
+        self.log("val_loss", loss, sync_dist=True)
+        return loss
 
     def configure_optimizers(self):
-        optimizer_g = optim.AdamW(self.autoencoderkl.parameters(),
-                                lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay)
-
-        optimizer_d = optim.AdamW(self.discriminator.parameters(),
-                                lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay)
-
-        return [optimizer_g, optimizer_d]
-
-    def training_step(self, train_batch, batch_idx):
-        x = train_batch[0]
-        y = train_batch[1]
-
-        optimizer_g, optimizer_d = self.optimizers()
-        
-        optimizer_g.zero_grad()
-
-        reconstruction, z_mu, z_sigma = self.autoencoderkl(self.noise_transform(x))
-
-        recons_loss = F.l1_loss(reconstruction.float(), y.float())
-        p_loss = self.perceptual_loss(reconstruction.float(), y.float())
-        kl_loss = 0.5 * torch.sum(z_mu.pow(2) + z_sigma.pow(2) - torch.log(z_sigma.pow(2)) - 1, dim=[1, 2, 3])
-        kl_loss = torch.sum(kl_loss) / kl_loss.shape[0]
-        loss_g = recons_loss + (self.hparams.kl_weight * kl_loss) + (self.hparams.perceptual_weight * p_loss)
-
-        if self.trainer.current_epoch > self.hparams.autoencoder_warm_up_n_epochs:
-            logits_fake = self.discriminator(reconstruction.contiguous().float())[-1]
-            generator_loss = self.adversarial_loss(logits_fake, target_is_real=True, for_discriminator=False)
-            loss_g += self.hparams.adversarial_weight * generator_loss
-
-        loss_g.backward()
-        optimizer_g.step()
-        
-        loss_d = 0
-        if self.trainer.current_epoch > self.hparams.autoencoder_warm_up_n_epochs:
-            
-            optimizer_d.zero_grad()
-
-            logits_fake = self.discriminator(reconstruction.contiguous().detach())[-1]
-            loss_d_fake = self.adversarial_loss(logits_fake, target_is_real=False, for_discriminator=True)
-            logits_real = self.discriminator(y.contiguous().detach())[-1]
-            loss_d_real = self.adversarial_loss(logits_real, target_is_real=True, for_discriminator=True)
-            discriminator_loss = (loss_d_fake + loss_d_real) * 0.5
-
-            loss_d = self.hparams.adversarial_weight * discriminator_loss
-
-            loss_d.backward()
-            optimizer_d.step()
-
-        self.log("train_loss_g", loss_g)
-        self.log("train_loss_d", loss_d)
-
-        return {"train_loss_g": loss_g, "train_loss_d": loss_d}
-        
-
-    def validation_step(self, val_batch, batch_idx):
-        x = val_batch[0]
-        y = val_batch[1]
-        # with autocast(enabled=True):
-        #     reconstruction, z_mu, z_sigma = self.autoencoderkl(x)
-        #     recon_loss = F.l1_loss(x.float(), reconstruction.float())
-
-        reconstruction, z_mu, z_sigma = self.autoencoderkl(x)
-        recon_loss = F.l1_loss(y.float(), reconstruction.float())
-
-        self.log("val_loss", recon_loss, sync_dist=True)
-
-        
-
-
-    def forward(self, images):        
-        return self.autoencoderkl(images)
-
-
-class AutoEncoderTanh(nets.AutoencoderKL):
-    def sampling(self, z_mu, z_sigma):
-        x = super().sampling(z_mu, z_sigma)
-        return F.tanh(x)
-
-class AutoEncoderTanhPL(pl.LightningModule):
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.save_hyperparameters()
-
-        latent_channels = 1
-
-        if hasattr(self.hparams, "latent_channels"):
-            latent_channels = self.hparams.latent_channels
-
-        self.autoencoder = AutoEncoderTanh(
-            spatial_dims=2,
-            in_channels=1,
-            out_channels=1,
-            num_channels=(128, 128, 256),
-            latent_channels=latent_channels,
-            num_res_blocks=2,
-            attention_levels=(False, False, False),
-            with_encoder_nonlocal_attn=False,
-            with_decoder_nonlocal_attn=False,
-        )
-
-        self.perceptual_loss = PerceptualLoss(spatial_dims=2, network_type="alex")
-
-        self.automatic_optimization = False
-
-        self.discriminator = nets.PatchDiscriminator(spatial_dims=2, num_layers_d=3, num_channels=64, in_channels=1, out_channels=1)        
-
-        self.adversarial_loss = PatchAdversarialLoss(criterion="least_squares")        
-
-        self.noise_transform = torch.nn.Sequential(
-            GaussianNoise(0.0, 0.05),
-            RandCoarseShuffle(),
-            SaltAndPepper()
-        )
-        
-
-    def configure_optimizers(self):
-        optimizer_g = optim.AdamW(self.autoencoder.parameters(),
-                                lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay)
-
-        optimizer_d = optim.AdamW(self.discriminator.parameters(),
-                                lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay)
-
-        return [optimizer_g, optimizer_d]
-
-    def training_step(self, train_batch, batch_idx):
-        x = train_batch
-
-        optimizer_g, optimizer_d = self.optimizers()
-        
-        optimizer_g.zero_grad()
-
-        reconstruction, z_mu, z_sigma = self.autoencoder(self.noise_transform(x))
-
-        recons_loss = F.l1_loss(reconstruction.float(), x.float())
-        p_loss = self.perceptual_loss(reconstruction.float(), x.float())
-        kl_loss = 0.5 * torch.sum(z_mu.pow(2) + z_sigma.pow(2) - torch.log(z_sigma.pow(2)) - 1, dim=[1, 2, 3])
-        kl_loss = torch.sum(kl_loss) / kl_loss.shape[0]
-        loss_g = recons_loss + (self.hparams.kl_weight * kl_loss) + (self.hparams.perceptual_weight * p_loss)
-
-        if self.trainer.current_epoch > self.hparams.autoencoder_warm_up_n_epochs:
-            logits_fake = self.discriminator(reconstruction.contiguous().float())[-1]
-            generator_loss = self.adversarial_loss(logits_fake, target_is_real=True, for_discriminator=False)
-            loss_g += self.hparams.adversarial_weight * generator_loss
-
-        loss_g.backward()
-        optimizer_g.step()
-        
-        loss_d = 0
-        if self.trainer.current_epoch > self.hparams.autoencoder_warm_up_n_epochs:
-            
-            optimizer_d.zero_grad()
-
-            logits_fake = self.discriminator(reconstruction.contiguous().detach())[-1]
-            loss_d_fake = self.adversarial_loss(logits_fake, target_is_real=False, for_discriminator=True)
-            logits_real = self.discriminator(x.contiguous().detach())[-1]
-            loss_d_real = self.adversarial_loss(logits_real, target_is_real=True, for_discriminator=True)
-            discriminator_loss = (loss_d_fake + loss_d_real) * 0.5
-
-            loss_d = self.hparams.adversarial_weight * discriminator_loss
-
-            loss_d.backward()
-            optimizer_d.step()
-
-        self.log("train_loss_g", loss_g)
-        self.log("train_loss_d", loss_d)
-
-        return {"train_loss_g": loss_g, "train_loss_d": loss_d}
-        
-
-    def validation_step(self, val_batch, batch_idx):
-        x = val_batch
-
-        reconstruction, z_mu, z_sigma = self.autoencoder(x)
-        recon_loss = F.l1_loss(x.float(), reconstruction.float())
-
-        self.log("val_loss", recon_loss, sync_dist=True)
-
-
-    def forward(self, images):        
-        return self.autoencoder(images)
-
-
-class DecoderKL(pl.LightningModule):
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.save_hyperparameters()
-
-        latent_channels = 3
-        if hasattr(self.hparams, "latent_channels"):
-            latent_channels = self.hparams.latent_channels
-
-        self.decoder = nets.AutoencoderKL(
-            spatial_dims=2,
-            in_channels=1,
-            out_channels=1,
-            num_channels=(128, 128, 256),
-            latent_channels=latent_channels,
-            num_res_blocks=2,
-            attention_levels=(False, False, False),
-            with_encoder_nonlocal_attn=False,
-            with_decoder_nonlocal_attn=False,
-        ).decoder
-
-        self.perceptual_loss = PerceptualLoss(spatial_dims=2, network_type="alex")
-
-        self.automatic_optimization = False
-
-        self.discriminator = nets.PatchDiscriminator(spatial_dims=2, num_layers_d=3, num_channels=64, in_channels=1, out_channels=1)        
-
-        self.adversarial_loss = PatchAdversarialLoss(criterion="least_squares")
-
-        self.noise_transform = torch.nn.Sequential(
-            GaussianNoise(0.0, 0.05),
-            RandCoarseShuffle(),
-            SaltAndPepper()
-        )
-
-        self.resize_transform = transforms.Resize([-1, 64, 64])
-        
-
-    def configure_optimizers(self):
-        optimizer_g = optim.AdamW(self.decoder.parameters(),
-                                lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay)
-
-        optimizer_d = optim.AdamW(self.discriminator.parameters(),
-                                lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay)
-
-        return [optimizer_g, optimizer_d]
-
-    def training_step(self, train_batch, batch_idx):
-        x = train_batch
-
-        optimizer_g, optimizer_d = self.optimizers()
-        
-        optimizer_g.zero_grad()
-
-        reconstruction = self(self.noise_transform(x))
-
-        recons_loss = F.l1_loss(reconstruction.float(), x.float())
-        p_loss = self.perceptual_loss(reconstruction.float(), x.float())
-        # kl_loss = 0.5 * torch.sum(z_mu.pow(2) + z_sigma.pow(2) - torch.log(z_sigma.pow(2)) - 1, dim=[1, 2, 3])
-        # kl_loss = torch.sum(kl_loss) / kl_loss.shape[0]
-        # loss_g = recons_loss + (self.hparams.kl_weight * kl_loss) + (self.hparams.perceptual_weight * p_loss)
-        loss_g = recons_loss + (self.hparams.perceptual_weight * p_loss)
-
-        if self.trainer.current_epoch > self.hparams.autoencoder_warm_up_n_epochs:
-            logits_fake = self.discriminator(reconstruction.contiguous().float())[-1]
-            generator_loss = self.adversarial_loss(logits_fake, target_is_real=True, for_discriminator=False)
-            loss_g += self.hparams.adversarial_weight * generator_loss
-
-        loss_g.backward()
-        optimizer_g.step()
-        
-        loss_d = 0
-        if self.trainer.current_epoch > self.hparams.autoencoder_warm_up_n_epochs:
-            
-            optimizer_d.zero_grad()
-
-            logits_fake = self.discriminator(reconstruction.contiguous().detach())[-1]
-            loss_d_fake = self.adversarial_loss(logits_fake, target_is_real=False, for_discriminator=True)
-            logits_real = self.discriminator(x.contiguous().detach())[-1]
-            loss_d_real = self.adversarial_loss(logits_real, target_is_real=True, for_discriminator=True)
-            discriminator_loss = (loss_d_fake + loss_d_real) * 0.5
-
-            loss_d = self.hparams.adversarial_weight * discriminator_loss
-
-            loss_d.backward()
-            optimizer_d.step()
-
-        self.log("train_loss_g", loss_g)
-        self.log("train_loss_d", loss_d)
-
-        return {"train_loss_g": loss_g, "train_loss_d": loss_d}
-        
-
-    def validation_step(self, val_batch, batch_idx):
-        x = val_batch
-
-        reconstruction = self(x)
-        recon_loss = F.l1_loss(x.float(), reconstruction.float())
-
-        self.log("val_loss", recon_loss, sync_dist=True)
-
-
-    def forward(self, images):        
-        return self.decoder(self.resize_transform(images))
-
-class AutoEncoderLowKL(pl.LightningModule):
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.save_hyperparameters()
-
-        self.model = nets.AutoencoderKL(
-            spatial_dims=2,
-            in_channels=1,
-            out_channels=1,
-            num_channels=(128, 128, 256),
-            latent_channels=self.hparams.latent_channels,
-            num_res_blocks=2,
-            attention_levels=(False, False, False),
-            with_encoder_nonlocal_attn=False,
-            with_decoder_nonlocal_attn=False,
-        )
-
-        self.perceptual_loss = PerceptualLoss(spatial_dims=2, network_type="alex")
-
-        self.automatic_optimization = False
-
-        self.discriminator = nets.PatchDiscriminator(spatial_dims=2, num_layers_d=3, num_channels=64, in_channels=1, out_channels=1)        
-
-        self.adversarial_loss = PatchAdversarialLoss(criterion="least_squares")
-
-        self.noise_transform = torch.nn.Sequential(
-            GaussianNoise(0.0, 0.05),
-            RandCoarseShuffle(),
-            SaltAndPepper()
-        )
-
-        self.resize_transform_low = transforms.Resize([-1, 64, 64])
-        self.resize_transform_high = transforms.Resize([-1, 256, 256])
-        
-
-    def configure_optimizers(self):
-        optimizer_g = optim.AdamW(self.model.parameters(),
-                                lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay)
-
-        optimizer_d = optim.AdamW(self.discriminator.parameters(),
-                                lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay)
-
-        return [optimizer_g, optimizer_d]
-
-    def training_step(self, train_batch, batch_idx):
-        x = train_batch
-
-        optimizer_g, optimizer_d = self.optimizers()
-        
-        optimizer_g.zero_grad()
-
-        reconstruction, z_mu, z_sigma = self(self.noise_transform(self.resize_transform_low(x)))
-
-        recons_loss = F.l1_loss(reconstruction.float(), x.float())
-        p_loss = self.perceptual_loss(reconstruction.float(), x.float())
-        kl_loss = 0.5 * torch.sum(z_mu.pow(2) + z_sigma.pow(2) - torch.log(z_sigma.pow(2)) - 1, dim=[1, 2, 3])
-        kl_loss = torch.sum(kl_loss) / kl_loss.shape[0]
-        loss_g = recons_loss + (self.hparams.kl_weight * kl_loss) + (self.hparams.perceptual_weight * p_loss)
-        loss_g = recons_loss + (self.hparams.perceptual_weight * p_loss)
-
-        if self.trainer.current_epoch > self.hparams.autoencoder_warm_up_n_epochs:
-            logits_fake = self.discriminator(reconstruction.contiguous().float())[-1]
-            generator_loss = self.adversarial_loss(logits_fake, target_is_real=True, for_discriminator=False)
-            loss_g += self.hparams.adversarial_weight * generator_loss
-
-        loss_g.backward()
-        optimizer_g.step()
-        
-        loss_d = 0
-        if self.trainer.current_epoch > self.hparams.autoencoder_warm_up_n_epochs:
-            
-            optimizer_d.zero_grad()
-
-            logits_fake = self.discriminator(reconstruction.contiguous().detach())[-1]
-            loss_d_fake = self.adversarial_loss(logits_fake, target_is_real=False, for_discriminator=True)
-            logits_real = self.discriminator(x.contiguous().detach())[-1]
-            loss_d_real = self.adversarial_loss(logits_real, target_is_real=True, for_discriminator=True)
-            discriminator_loss = (loss_d_fake + loss_d_real) * 0.5
-
-            loss_d = self.hparams.adversarial_weight * discriminator_loss
-
-            loss_d.backward()
-            optimizer_d.step()
-
-        self.log("train_loss_g", loss_g)
-        self.log("train_loss_d", loss_d)
-
-        return {"train_loss_g": loss_g, "train_loss_d": loss_d}
-        
-
-    def validation_step(self, val_batch, batch_idx):
-        x = val_batch
-
-        reconstruction, z_mu, z_sigma = self(self.resize_transform_low(x))
-        recon_loss = F.l1_loss(x.float(), reconstruction.float())
-
-        self.log("val_loss", recon_loss, sync_dist=True)
-
-
-    def forward(self, images):        
-        return self.model(self.resize_transform_high(images))
-
-class CycleVQVAE(pl.LightningModule):
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.save_hyperparameters()
-
-        self.generator_a = nets.VQVAE(
-            spatial_dims=2,
-            in_channels=1,
-            out_channels=1,
-            num_channels=(256, 512),
-            num_res_channels=512,
-            num_res_layers=2,
-            downsample_parameters=((2, 4, 1, 1), (2, 4, 1, 1)),
-            upsample_parameters=((2, 4, 1, 1, 0), (2, 4, 1, 1, 0)),
-            num_embeddings=256,
-            embedding_dim=32,
-        )
-
-        self.generator_b = nets.VQVAE(
-            spatial_dims=2,
-            in_channels=1,
-            out_channels=1,
-            num_channels=(256, 512),
-            num_res_channels=512,
-            num_res_layers=2,
-            downsample_parameters=((2, 4, 1, 1), (2, 4, 1, 1)),
-            upsample_parameters=((2, 4, 1, 1, 0), (2, 4, 1, 1, 0)),
-            num_embeddings=256,
-            embedding_dim=32,
-        )
-
-        self.discriminator_a = nets.PatchDiscriminator(spatial_dims=2, num_layers_d=3, num_channels=64, in_channels=1, out_channels=1)        
-        self.discriminator_b = nets.PatchDiscriminator(spatial_dims=2, num_layers_d=3, num_channels=64, in_channels=1, out_channels=1)        
-
-        self.cycle_loss = nn.L1Loss()
-        self.idt_loss = nn.L1Loss()
-        self.adv_loss = PatchAdversarialLoss(criterion="least_squares")
-        self.perceptual_loss = PerceptualLoss(spatial_dims=2, network_type="alex")
-
-        self.automatic_optimization = False
-
-    def get_b(self, x):
-        return self.generator_b(x)[0]
-
-    def get_a(self, x):
-        return self.generator_a(x)[0]
-
-    def configure_optimizers(self):
-        g_params = list(self.generator_a.parameters()) + list(self.generator_b.parameters())
-        optimizer_g = optim.AdamW(g_params,
-                                lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay)
-
-        d_params = list(self.discriminator_a.parameters()) + list(self.discriminator_b.parameters())
-        optimizer_d = optim.AdamW(d_params,
-                                lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay)
-
-        return [optimizer_g, optimizer_d]
-
-    def set_requires_grad(self, nets, requires_grad=False):
-        """Set requies_grad=Fasle for all the networks to avoid unnecessary computations
-        Parameters:
-            nets (network list)   -- a list of networks
-            requires_grad (bool)  -- whether the networks require gradients or not
-        """
-        if not isinstance(nets, list):
-            nets = [nets]
-        for net in nets:
-            if net is not None:
-                for param in net.parameters():
-                    param.requires_grad = requires_grad
-
-
-    def compute_loss_g(self, real_a, fake_b, reconstruction_a, real_b, fake_a, reconstruction_b):
-        """Calculate the loss for generators G_A and G_B"""
-        # lambda_idt = self.opt.lambda_identity
-        # lambda_A = self.opt.lambda_A
-        # lambda_B = self.opt.lambda_B
-        # # Identity loss
-        # if lambda_idt > 0:
-        #     # G_A should be identity if real_B is fed: ||G_A(B) - B||
-        #     self.idt_A = self.netG_A(self.real_B)
-        #     self.loss_idt_A = self.criterionIdt(self.idt_A, self.real_B) * lambda_B * lambda_idt
-        #     # G_B should be identity if real_A is fed: ||G_B(A) - A||
-        #     self.idt_B = self.netG_B(self.real_A)
-        #     self.loss_idt_B = self.criterionIdt(self.idt_B, self.real_A) * lambda_A * lambda_idt
-        # else:
-        #     self.loss_idt_A = 0
-        #     self.loss_idt_B = 0
-
-        # GAN loss D_A(G_A(A))
-        logits_fake_b = self.discriminator_a(fake_b.contiguous().float())[-1]
-        loss_generator_a = self.adv_loss(logits_fake_b, target_is_real=True, for_discriminator=False) * self.hparams.gamma_a
-        # GAN loss D_B(G_B(B))        
-        logits_fake_a = self.discriminator_b(fake_a.contiguous().float())[-1]
-        loss_generator_b = self.adv_loss(logits_fake_a, target_is_real=True, for_discriminator=False)  * self.hparams.gamma_b
-        
-        # Forward cycle loss || G_B(G_A(A)) - A||
-        loss_cycle_a = self.cycle_loss(reconstruction_a, real_a) * self.hparams.lambda_a
-        # Backward cycle loss || G_A(G_B(B)) - B||
-        loss_cycle_b = self.cycle_loss(reconstruction_b, real_b) * self.hparams.lambda_b
-        # combined loss and calculate gradients
-
-        perceptual_loss_a = self.perceptual_loss(fake_a.float(), real_a.float()) * self.hparams.ommega_a
-        perceptual_loss_b = self.perceptual_loss(fake_b.float(), real_b.float()) * self.hparams.ommega_b
-
-        return loss_generator_a + loss_generator_b + loss_cycle_a + loss_cycle_b + perceptual_loss_a + perceptual_loss_b
-
-    def compute_loss_d(self, discriminator, real, fake):
-        """Calculate GAN loss for the discriminator
-
-        Parameters:
-            netD (network)      -- the discriminator D
-            real (tensor array) -- real images
-            fake (tensor array) -- images generated by a generator
-
-        Return the discriminator loss.
-        We also call loss_D.backward() to calculate the gradients.
-        """
-        # Real
-        logits_real = discriminator(real.contiguous().float())[-1]        
-        loss_discriminator_real = self.adv_loss(logits_real, target_is_real=True, for_discriminator=True)        
-        # Fake
-        logits_fake = discriminator(fake.detach().contiguous().float())[-1]        
-        loss_discriminator_fake = self.adv_loss(logits_fake, target_is_real=False, for_discriminator=True)        
-        # Combined loss and calculate gradients
-        return (loss_discriminator_real + loss_discriminator_fake) * 0.5        
-
-    def training_step(self, train_batch, batch_idx):
-        real_a, real_b = train_batch
-
-        optimizer_g, optimizer_d = self.optimizers()
-
-        # forward        
-        fake_b, q_loss_b = self.generator_a(real_a)  # G_A(A)
-        reconstruction_a, q_loss_a = self.generator_b(fake_b)   # G_B(G_A(A))
-        
-        fake_a, q_loss_a = self.generator_b(real_b)  # G_B(B)
-        reconstruction_b, q_loss_b = self.generator_a(fake_a)   # G_A(G_B(B))
-
-        # Optimize generator
-        self.set_requires_grad([self.discriminator_a, self.discriminator_b], requires_grad=False)
-        optimizer_g.zero_grad()        
-        loss_g = self.compute_loss_g(real_a, fake_b, reconstruction_a, real_b, fake_a, reconstruction_b)
-        
-        loss_g.backward()
-        optimizer_g.step()
-
-      
-        # D_A and D_B
-        self.set_requires_grad([self.discriminator_a, self.discriminator_b], requires_grad=True)
-        optimizer_d.zero_grad()   # set D_A and D_B's gradients to zero
-        loss_d_a = self.compute_loss_d(self.discriminator_b, real_a, fake_a)      # calculate gradients for D_b
-        loss_d_a.backward()
-        loss_d_b = self.compute_loss_d(self.discriminator_a, real_b, fake_b)      # calculate gradients for D_a
-        loss_d_b.backward()
-        optimizer_d.step()  # update D_A and D_B's weights
-
-        loss_d = loss_d_a + loss_d_b
-
-        # # Generator part
-        # fake_us, quantization_loss_fake_us = self.get_a(x_must)
-        # reconstruction_must, quantization_loss_must = self.get_b(fake_us)
-
-        # fake_must, quantization_loss_fake_must = self.get_must(x_us)
-        # reconstruction_us, quantization_loss_us = self.get_us(fake_must)
-
-        # logits_fake_us = self.discriminator_us(fake_us.contiguous().float())[-1]
-        # logits_fake_must = self.discriminator_must(fake_must.contiguous().float())[-1]
-
-        # recons_loss_must = self.l1_loss(reconstruction_must.float(), x_must.float())
-        # p_loss_must = self.perceptual_loss(fake_must.float(), x_must.float())
-
-        # recons_loss_us = self.l1_loss(reconstruction_us.float(), x_us.float())
-        # p_loss_us = self.perceptual_loss(fake_us.float(), x_us.float())
-        
-        
-        # generator_loss = self.adv_loss(logits_fake_us, target_is_real=True, for_discriminator=False) + self.adv_loss(logits_fake_must, target_is_real=True, for_discriminator=False)
-        # recons_loss = recons_loss_must + recons_loss_us
-        # quantization_loss = quantization_loss_fake_us + quantization_loss_must + quantization_loss_fake_must + quantization_loss_us
-        # p_loss = self.hparams.perceptual_weight * (p_loss_must + p_loss_us)
-
-        # loss_g = recons_loss + quantization_loss + p_loss + self.hparams.adversarial_weight * generator_loss
-
-        # loss_g.backward()
-        # optimizer_g.step()
-
-        # # Discriminator part
-        # optimizer_d.zero_grad(set_to_none=True)
-
-        # logits_fake_must = self.discriminator_must(reconstruction_must.contiguous().detach())[-1]
-        # loss_d_fake_must = self.adv_loss(logits_fake_must, target_is_real=False, for_discriminator=True)
-        # logits_real_must = self.discriminator_must(x_must.contiguous().detach())[-1]
-        # loss_d_real_must = self.adv_loss(logits_real_must, target_is_real=True, for_discriminator=True)
-        # discriminator_loss_must = (loss_d_fake_must + loss_d_real_must) * 0.5
-
-        # logits_fake_us = self.discriminator_us(reconstruction_us.contiguous().detach())[-1]
-        # loss_d_fake_us = self.adv_loss(logits_fake_us, target_is_real=False, for_discriminator=True)
-        # logits_real_us = self.discriminator_us(x_us.contiguous().detach())[-1]
-        # loss_d_real_us = self.adv_loss(logits_real_us, target_is_real=True, for_discriminator=True)
-        # discriminator_loss_us = (loss_d_fake_us + loss_d_real_us) * 0.5
-
-        # discriminator_loss = discriminator_loss_must + discriminator_loss_us
-
-        # loss_d = self.hparams.adversarial_weight * discriminator_loss
-
-        # loss_d.backward()
-        # optimizer_d.step()
-
-
-        self.log("train_loss_g", loss_g)
-        self.log("train_loss_d", loss_d)
-
-
-        return {"train_loss_g": loss_g, "train_loss_d": loss_d}
+        optimizer = optim.Adam(self.net.parameters(), lr=self.hparams.lr)
+        return optimizer
     
-    def validation_step(self, val_batch, batch_idx):        
-        real_a, real_b = val_batch
+    def sample(self, num_samples=1):
 
-        # forward        
-        fake_b, q_loss_b = self.generator_a(real_a)  # G_A(A)
-        reconstruction_a, q_loss_a = self.generator_b(fake_b)   # G_B(G_A(A))
-        
-        fake_a, q_loss_a = self.generator_b(real_b)  # G_B(B)
-        reconstruction_b, q_loss_b = self.generator_a(fake_a)   # G_A(G_B(B))
+        size = list(self.hparams.image_size)
+        size = [num_samples, self.hparams.in_channels] + size
 
-        loss_g = self.compute_loss_g(real_a, fake_b, reconstruction_a, real_b, fake_a, reconstruction_b)
+        noisy_image = torch.randn(size).to(self.device)
+        # Sample timesteps
+        timesteps = self.scheduler.timesteps.to(self.device)
 
-        self.log("val_loss", loss_g, sync_dist=True)
-        # self.log("val_loss_quantization", quantization_loss, sync_dist=True)
+        # Reverse process (denoising)
+        with torch.no_grad():
+            for i, t in enumerate(timesteps):
+                # Predict noise
+                noise_pred = self.net(noisy_image, t.unsqueeze(0)).sample
+                
+                # Remove noise using scheduler
+                noisy_image = self.scheduler.step(noise_pred, t, noisy_image).prev_sample
 
+        return noisy_image
 
-class ResnetGenerator(nn.Module):
-    """Resnet-based generator that consists of Resnet blocks between a few downsampling/upsampling operations.
+class USDDPMPC(LightningModule):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.save_hyperparameters()
 
-    We adapt Torch code and idea from Justin Johnson's neural style transfer project(https://github.com/jcjohnson/fast-neural-style)
-    """
-
-    def __init__(self, input_nc, output_nc, ngf=64, norm_layer=nn.BatchNorm2d, use_dropout=False, n_blocks=6, padding_type='reflect'):
-        """Construct a Resnet-based generator
-
-        Parameters:
-            input_nc (int)      -- the number of channels in input images
-            output_nc (int)     -- the number of channels in output images
-            ngf (int)           -- the number of filters in the last conv layer
-            norm_layer          -- normalization layer
-            use_dropout (bool)  -- if use dropout layers
-            n_blocks (int)      -- the number of ResNet blocks
-            padding_type (str)  -- the name of padding layer in conv layers: reflect | replicate | zero
-        """
-        assert(n_blocks >= 0)
-        super(ResnetGenerator, self).__init__()
-        if type(norm_layer) == functools.partial:
-            use_bias = norm_layer.func == nn.InstanceNorm2d
+        if self.hparams.autoencoder_fn is not None:
+            au = AutoEncoderKL.load_from_checkpoint(self.hparams.autoencoder_fn)
+            au.freeze()
+            au = au.autoencoderkl
         else:
-            use_bias = norm_layer == nn.InstanceNorm2d
+            au = nets.AutoencoderKL(
+                spatial_dims=2,
+                in_channels=self.hparams.in_channels,
+                out_channels=self.hparams.out_channels,
+                num_channels=self.hparams.num_channels,
+                latent_channels=self.hparams.latent_channels,
+                num_res_blocks=self.hparams.num_res_blocks,
+                norm_num_groups=self.hparams.norm_num_groups,
+                attention_levels=(False, False, True),
+            )
+        self.encoder = TimeDistributed(au.encoder, time_dim=2)
+        self.quant_conv_mu = TimeDistributed(au.quant_conv_mu, time_dim=2)
+        self.quant_conv_log_sigma = TimeDistributed(au.quant_conv_log_sigma, time_dim=2)
+        
+        self.vs = VolumeSamplingBlindSweep()
 
-        model = [nn.ReflectionPad2d(3),
-                 nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0, bias=use_bias),
-                 norm_layer(ngf),
-                 nn.ReLU(True)]
+        self.attn_chunk = AttentionChunk(input_dim=(self.hparams.latent_channels*64*64), hidden_dim=64, chunks=self.hparams.n_chunks)
+        self.proj = ProjectionHead(input_dim=(self.hparams.latent_channels*64*64), hidden_dim=1280, output_dim=self.hparams.embed_dim)
 
-        n_downsampling = 2
-        for i in range(n_downsampling):  # add downsampling layers
-            mult = 2 ** i
-            model += [nn.Conv2d(ngf * mult, ngf * mult * 2, kernel_size=3, stride=2, padding=1, bias=use_bias),
-                      norm_layer(ngf * mult * 2),
-                      nn.ReLU(True)]
+        self.dropout = nn.Dropout(self.hparams.dropout)
 
-        mult = 2 ** n_downsampling
-        for i in range(n_blocks):       # add ResNet blocks
+        self.p_encoding = PositionalEncoding2D(self.hparams.embed_dim)
 
-            model += [ResnetBlock(ngf * mult, padding_type=padding_type, norm_layer=norm_layer, use_dropout=use_dropout, use_bias=use_bias)]
+        self.diffnet = UNet2DConditionModel(
+            in_channels=self.hparams.input_dim, 
+            out_channels=self.hparams.output_dim, 
+            cross_attention_dim=self.hparams.embed_dim, 
+            flip_sin_to_cos=self.hparams.flip_sin_to_cos,
+            time_embedding_type=self.hparams.time_embedding_type,
+            freq_shift=self.hparams.freq_shift)
+        
 
-        for i in range(n_downsampling):  # add upsampling layers
-            mult = 2 ** (n_downsampling - i)
-            model += [nn.ConvTranspose2d(ngf * mult, int(ngf * mult / 2),
-                                         kernel_size=3, stride=2,
-                                         padding=1, output_padding=1,
-                                         bias=use_bias),
-                      norm_layer(int(ngf * mult / 2)),
-                      nn.ReLU(True)]
-        model += [nn.ReflectionPad2d(3)]
-        model += [nn.Conv2d(ngf, output_nc, kernel_size=7, padding=0)]
-        model += [nn.Tanh()]
+        self.loss_fn = nn.MSELoss()
 
-        self.model = nn.Sequential(*model)
+        self.noise_scheduler = DDPMScheduler(num_train_timesteps=self.hparams.num_train_steps, 
+                                             beta_schedule="linear",
+                                             clip_sample=False,
+                                             prediction_type='epsilon')
 
-    def forward(self, input):
-        """Standard forward"""
-        return self.model(input)
+        self.simu0 = TimeDistributed(us_simulation_jit.MergedLinearCutLabel11(), time_dim=2)
+        self.simu1 = TimeDistributed(us_simulation_jit.MergedCutLabel11(), time_dim=2)
+        self.simu2 = TimeDistributed(us_simulation_jit.MergedUSRLabel11(), time_dim=2)
+        self.simu3 = TimeDistributed(us_simulation_jit.MergedLinearLabel11(), time_dim=2)
+        self.simu4 = TimeDistributed(us_simulation_jit.MergedLinearLabel11WOG(), time_dim=2)
+
+        
     
-class ResnetBlock(nn.Module):
-    """Define a Resnet block"""
+    @staticmethod
+    def add_model_specific_args(parent_parser):
+        group = parent_parser.add_argument_group("USDDPMPC")
 
-    def __init__(self, dim, padding_type, norm_layer, use_dropout, use_bias):
-        """Initialize the Resnet block
+        group.add_argument("--lr", type=float, default=1e-4)
+        group.add_argument('--weight_decay', help='Weight decay for optimizer', type=float, default=0.01)
+        
+        # Image Encoder parameters 
 
-        A resnet block is a conv block with skip connections
-        We construct a conv block with build_conv_block function,
-        and implement skip connections in <forward> function.
-        Original Resnet paper: https://arxiv.org/pdf/1512.03385.pdf
-        """
-        super(ResnetBlock, self).__init__()
-        self.conv_block = self.build_conv_block(dim, padding_type, norm_layer, use_dropout, use_bias)
+        group.add_argument("--autoencoder_fn", type=str, default="/mnt/raid/C1_ML_Analysis/train_output/diffusionAE/extract_frames_Dataset_C_masked_resampled_256_spc075_wscores_meta_BPD01_MACFL025-7mo-9mo/v0.4/epoch=72-val_loss=0.01.ckpt", help='Pre trained autoencoder model')
+        group.add_argument("--latent_channels", type=int, default=3, help='Output dimension for the image encoder')
+        group.add_argument("--spatial_dims", type=int, default=2, help='Spatial dimensions for the autoencoder')
+        group.add_argument("--in_channels", type=int, default=1, help='Input channels for the autoencoder')
+        group.add_argument("--out_channels", type=int, default=1, help='Output channels for the autoencoder')
+        group.add_argument("--num_channels", type=int, nargs="*", default=[128, 256, 384], help='Number of channels for each stage of the image encoder')
+        group.add_argument("--num_res_blocks", type=int, default=1, help='Number of residual blocks')
+        group.add_argument("--norm_num_groups", type=int, default=32, help='Number of groups for the normalization layer')
+        group.add_argument("--n_chunks_e", type=int, default=10, help='Number of chunks in the encoder stage to reduce memory usage')
+        group.add_argument("--n_chunks", type=int, default=8, help='Number of outputs in the time dimension')
+        group.add_argument("--z_prob", type=float, default=0.2, help='Probability of dropping the latent code')
+        
+        
+        # Encoder parameters for the diffusion model
+        group.add_argument("--num_samples", type=int, default=4096, help='Number of samples to take from the mesh to start the encoding')
+        group.add_argument("--input_dim", type=int, default=3, help='Input dimension for the encoder')
+        group.add_argument("--embed_dim", type=int, default=1280, help='Embedding dimension')
+        group.add_argument("--output_dim", type=int, default=3, help='Output dimension of the model')
+        group.add_argument("--dropout", type=float, default=0.25, help='Dropout rate')
+        
+        group.add_argument("--num_train_steps", type=int, default=1000, help='Number of training steps for the noise scheduler')
+        group.add_argument("--time_embedding_type", type=str, default='positional', help='Time embedding type', choices=['fourier', 'positional'])
+        
+        group.add_argument("--flip_sin_to_cos", type=int, default=1, help='Whether to flip sin to cos for Fourier time embedding.')
+        group.add_argument("--freq_shift", type=int, default=0, help='Frequency shift for Fourier time embedding.')
 
-    def build_conv_block(self, dim, padding_type, norm_layer, use_dropout, use_bias):
-        """Construct a convolutional block.
+        group.add_argument("--num_random_sweeps", type=int, default=0, help='How many random sweeps to use. 0 == all')
+        group.add_argument("--n_grids", type=int, default=200, help='Number of grids')
+        # group.add_argument("--target_label", type=int, default=7, help='Target label')
 
-        Parameters:
-            dim (int)           -- the number of channels in the conv layer.
-            padding_type (str)  -- the name of padding layer: reflect | replicate | zero
-            norm_layer          -- normalization layer
-            use_dropout (bool)  -- if use dropout layers.
-            use_bias (bool)     -- if the conv layer uses bias or not
+        # group.add_argument("--n_fixed_samples", type=int, default=12288, help='Number of fixed samples')
 
-        Returns a conv block (with a conv layer, a normalization layer, and a non-linearity layer (ReLU))
-        """
-        conv_block = []
-        p = 0
-        if padding_type == 'reflect':
-            conv_block += [nn.ReflectionPad2d(1)]
-        elif padding_type == 'replicate':
-            conv_block += [nn.ReplicationPad2d(1)]
-        elif padding_type == 'zero':
-            p = 1
-        else:
-            raise NotImplementedError('padding [%s] is not implemented' % padding_type)
-
-        conv_block += [nn.Conv2d(dim, dim, kernel_size=3, padding=p, bias=use_bias), norm_layer(dim), nn.ReLU(True)]
-        if use_dropout:
-            conv_block += [nn.Dropout(0.5)]
-
-        p = 0
-        if padding_type == 'reflect':
-            conv_block += [nn.ReflectionPad2d(1)]
-        elif padding_type == 'replicate':
-            conv_block += [nn.ReplicationPad2d(1)]
-        elif padding_type == 'zero':
-            p = 1
-        else:
-            raise NotImplementedError('padding [%s] is not implemented' % padding_type)
-        conv_block += [nn.Conv2d(dim, dim, kernel_size=3, padding=p, bias=use_bias), norm_layer(dim)]
-
-        return nn.Sequential(*conv_block)
-
-    def forward(self, x):
-        """Forward function (with skip connections)"""
-        out = x + self.conv_block(x)  # add skip connections
-        return out
+        return parent_parser
     
-
-class CycleGAN(pl.LightningModule):
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.save_hyperparameters()
-
-        self.generator_a = ResnetGenerator(input_nc=1, output_nc=1)
-        self.generator_b = ResnetGenerator(input_nc=1, output_nc=1)
-
-        self.discriminator_a = nets.PatchDiscriminator(spatial_dims=2, num_layers_d=3, num_channels=64, in_channels=1, out_channels=1)        
-        self.discriminator_b = nets.PatchDiscriminator(spatial_dims=2, num_layers_d=3, num_channels=64, in_channels=1, out_channels=1)        
-
-        self.cycle_loss = nn.L1Loss()
-        self.idt_loss = nn.L1Loss()
-        self.adv_loss = PatchAdversarialLoss(criterion="least_squares")
-        self.perceptual_loss = PerceptualLoss(spatial_dims=2, network_type="alex")
-
-        self.automatic_optimization = False
-
-    def get_b(self, x):
-        return self.generator_b(x)
-
-    def get_a(self, x):
-        return self.generator_a(x)
-
     def configure_optimizers(self):
-        g_params = list(self.generator_a.parameters()) + list(self.generator_b.parameters())
-        optimizer_g = optim.AdamW(g_params,
+        optimizer = optim.AdamW(self.parameters(),
                                 lr=self.hparams.lr,
                                 weight_decay=self.hparams.weight_decay)
+        return optimizer
 
-        d_params = list(self.discriminator_a.parameters()) + list(self.discriminator_b.parameters())
-        optimizer_d = optim.AdamW(d_params,
-                                lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay)
+    def on_fit_start(self):        
 
-        return [optimizer_g, optimizer_d]
+        # Define the file names directly without using out_dir
+        grid_t_file = 'grid_t.pt'
+        inverse_grid_t_file = 'inverse_grid_t.pt'
+        mask_fan_t_file = 'mask_fan_t.pt'
 
-    def set_requires_grad(self, nets, requires_grad=False):
-        """Set requies_grad=Fasle for all the networks to avoid unnecessary computations
-        Parameters:
-            nets (network list)   -- a list of networks
-            requires_grad (bool)  -- whether the networks require gradients or not
-        """
-        if not isinstance(nets, list):
-            nets = [nets]
-        for net in nets:
-            if net is not None:
-                for param in net.parameters():
-                    param.requires_grad = requires_grad
+        if not os.path.exists(grid_t_file):
+            grid_tensor = []
+            inverse_grid_t = []
+            mask_fan_t = []
 
+            for i in range(self.hparams.n_grids):
 
-    def compute_loss_g(self, real_a, fake_a, reconstruction_a, real_b, fake_b, reconstruction_b):
-        """Calculate the loss for generators G_A and G_B"""
-        loss_idt = 0
-        # Identity loss
-        if self.hparams.lambda_idt > 0:
-            idt_a = self.generator_a(real_a)
-            loss_idt_a = self.idt_loss(real_a, idt_a)
+                grid_w, grid_h = self.hparams.grid_w, self.hparams.grid_h
+                center_x = self.hparams.center_x
+                r1 = self.hparams.r1
+
+                center_y = self.hparams.center_y_start + (self.hparams.center_y_end - self.hparams.center_y_start) * (torch.rand(1))
+                r2 = self.hparams.r2_start + ((self.hparams.r2_end - self.hparams.r2_start) * torch.rand(1)).item()
+                theta = self.hparams.theta_start + ((self.hparams.theta_end - self.hparams.theta_start) * torch.rand(1)).item()
+                
+                grid, inverse_grid, mask = self.USR.init_grids(grid_w, grid_h, center_x, center_y, r1, r2, theta)
+
+                grid_tensor.append(grid.unsqueeze(dim=0))
+                inverse_grid_t.append(inverse_grid.unsqueeze(dim=0))
+                mask_fan_t.append(mask.unsqueeze(dim=0))
+
+            self.grid_t = torch.cat(grid_tensor).to(self.device)
+            self.inverse_grid_t = torch.cat(inverse_grid_t).to(self.device)
+            self.mask_fan_t = torch.cat(mask_fan_t).to(self.device)
+
+            # Save tensors directly to the current directory
             
-            idt_b = self.generator_b(self.real_b)
-            loss_idt_b = self.idt_loss(real_b, idt_b)
+            torch.save(self.grid_t, grid_t_file)
+            torch.save(self.inverse_grid_t, inverse_grid_t_file)
+            torch.save(self.mask_fan_t, mask_fan_t_file)
 
-            loss_idt = (loss_idt_a + loss_idt_b)*self.hparams.lambda_idt
-
-        # GAN loss D_A(G_A(A))
-        logits_fake_a = self.discriminator_a(fake_a.contiguous().float())[-1]
-        loss_generator_a = self.adv_loss(logits_fake_a, target_is_real=True, for_discriminator=False) * self.hparams.gamma_a
-        # GAN loss D_B(G_B(B))        
-        logits_fake_b = self.discriminator_b(fake_b.contiguous().float())[-1]
-        loss_generator_b = self.adv_loss(logits_fake_b, target_is_real=True, for_discriminator=False)  * self.hparams.gamma_b
+            # print("Grids SAVED!")
+            # print(self.grid_t.shape, self.inverse_grid_t.shape, self.mask_fan_t.shape)
         
-        # Forward cycle loss || G_B(G_A(A)) - A||
-        loss_cycle_a = self.cycle_loss(reconstruction_a, real_a) * self.hparams.lambda_a
-        # Backward cycle loss || G_A(G_B(B)) - B||
-        loss_cycle_b = self.cycle_loss(reconstruction_b, real_b) * self.hparams.lambda_b
-        # combined loss and calculate gradients
-
-        perceptual_loss_a = self.perceptual_loss(fake_a.float(), real_a.float()) * self.hparams.ommega_a
-        perceptual_loss_b = self.perceptual_loss(fake_b.float(), real_b.float()) * self.hparams.ommega_b
-
-        return loss_generator_a + loss_generator_b + loss_cycle_a + loss_cycle_b + perceptual_loss_a + perceptual_loss_b + loss_idt
-
-    def compute_loss_d(self, discriminator, real, fake):
-        """Calculate GAN loss for the discriminator
-
-        Parameters:
-            netD (network)      -- the discriminator D
-            real (tensor array) -- real images
-            fake (tensor array) -- images generated by a generator
-
-        Return the discriminator loss.
-        We also call loss_D.backward() to calculate the gradients.
-        """
-        # Real
-        logits_real = discriminator(real.contiguous().float())[-1]        
-        loss_discriminator_real = self.adv_loss(logits_real, target_is_real=True, for_discriminator=True)        
-        # Fake
-        logits_fake = discriminator(fake.detach().contiguous().float())[-1]        
-        loss_discriminator_fake = self.adv_loss(logits_fake, target_is_real=False, for_discriminator=True)        
-        # Combined loss and calculate gradients
-        return (loss_discriminator_real + loss_discriminator_fake) * 0.5        
-
-    def training_step(self, train_batch, batch_idx):
-        real_a, real_b = train_batch
-
-        optimizer_g, optimizer_d = self.optimizers()
-
-        # forward        
-        fake_b = self.generator_b(real_a)  # G_A(A)
-        reconstruction_a = self.generator_a(fake_b.clone().detach())   # G_B(G_A(A))
-        
-        fake_a = self.generator_a(real_b)  # G_B(B)
-        reconstruction_b = self.generator_b(fake_a.clone().detach())   # G_A(G_B(B))
-
-        # Optimize generator
-        self.set_requires_grad([self.discriminator_a, self.discriminator_b], requires_grad=False)
-
-        optimizer_g.zero_grad()        
-        loss_g = self.compute_loss_g(real_a, fake_a, reconstruction_a, real_b, fake_b, reconstruction_b)
-        loss_g.backward()
-        optimizer_g.step()
-      
-        # D_A and D_B
-        self.set_requires_grad([self.discriminator_a, self.discriminator_b], requires_grad=True)
-        optimizer_d.zero_grad()   # set D_A and D_B's gradients to zero
-        loss_d_a = self.compute_loss_d(self.discriminator_a, real_a, fake_a)      # calculate gradients for D_b
-        loss_d_a.backward()
-        loss_d_b = self.compute_loss_d(self.discriminator_b, real_b, fake_b)      # calculate gradients for D_a
-        loss_d_b.backward()
-        optimizer_d.step()  # update D_A and D_B's weights
-
-        loss_d = loss_d_a + loss_d_b
-
-        self.log("train_loss_g", loss_g)
-        self.log("train_loss_d", loss_d)
-
-
-        return {"train_loss_g": loss_g, "train_loss_d": loss_d}
-    
-    def validation_step(self, val_batch, batch_idx):        
-        real_a, real_b = val_batch
-
-        # forward        
-        fake_b = self.generator_b(real_a)  # G_A(A)
-        reconstruction_a = self.generator_a(fake_b)   # G_B(G_A(A))
-        
-        fake_a = self.generator_a(real_b)  # G_B(B)
-        reconstruction_b = self.generator_b(fake_a)   # G_A(G_B(B))
-
-        loss_g = self.compute_loss_g(real_a, fake_a, reconstruction_a, real_b, fake_b, reconstruction_b)
-
-        self.log("val_loss", loss_g, sync_dist=True)
-
-class CycleAutoEncoderKLV2(pl.LightningModule):
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.save_hyperparameters()
-
-        self.autoencoderkl_mr_us = nets.AutoencoderKL(
-            spatial_dims=2,
-            in_channels=1,
-            out_channels=1,
-            num_channels=(128, 128, 256),
-            latent_channels=3,
-            num_res_blocks=2,
-            attention_levels=(False, False, False),
-            with_encoder_nonlocal_attn=False,
-            with_decoder_nonlocal_attn=False,
-        )
-
-        self.autoencoderkl_us_mr = nets.AutoencoderKL(
-            spatial_dims=2,
-            in_channels=1,
-            out_channels=1,
-            num_channels=(128, 128, 256),
-            latent_channels=3,
-            num_res_blocks=2,
-            attention_levels=(False, False, False),
-            with_encoder_nonlocal_attn=False,
-            with_decoder_nonlocal_attn=False,
-        )
-
-        self.perceptual_loss = PerceptualLoss(spatial_dims=2, network_type="alex")
-
-        self.automatic_optimization = False
-
-        self.discriminator_mr = nets.PatchDiscriminator(spatial_dims=2, num_layers_d=3, num_channels=64, in_channels=1, out_channels=1)        
-        self.discriminator_us = nets.PatchDiscriminator(spatial_dims=2, num_layers_d=3, num_channels=64, in_channels=1, out_channels=1)        
-
-        self.adversarial_loss = PatchAdversarialLoss(criterion="least_squares")
-
-    def get_us(self, x_mr):
-        return self.autoencoderkl_mr_us(x_mr)
-
-    def get_mr(self, x_us):
-        return self.autoencoderkl_us_mr(x_us)
-
-    def configure_optimizers(self):
-        g_params = list(self.autoencoderkl_mr_us.parameters()) + list(self.autoencoderkl_us_mr.parameters())
-        optimizer_g = optim.AdamW(g_params,
-                                lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay)
-
-        d_params = list(self.discriminator_mr.parameters()) + list(self.discriminator_us.parameters())
-        optimizer_d = optim.AdamW(d_params,
-                                lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay)
-
-        return [optimizer_g, optimizer_d]
-
-    def training_step(self, train_batch, batch_idx):
-        x_mr, x_us = train_batch
-
-        optimizer_g, optimizer_d = self.optimizers()
-
-        optimizer_g.zero_grad()
-
-        # # MR -> US -> MR
-        # # 1. Encode the MR using the trained mr encoder
-        # z_mr = self.encode_mr(x_mr)
-        # # 2. Pass it through the autoencoder to transform it to the US domain
-        # z_mr_us, z_mu_mr_us, z_sigma_mr_us = self.autoencoderkl_mr_us(z_mr)
-        # # 3. Reconstruct an US using the trained US decoder this is the fake MR from US
-        # reconstruction_mr_us = self.decode_us(z_mr_us)
-
-
-        reconstruction_mr_us, z_mu_mr_us, z_sigma_mr_us = self.get_us(x_mr)
-        reconstruction_mr, z_mu_us_mr, z_sigma_us_mr = self.get_mr(reconstruction_mr_us)
-
-        # z_us = self.encode_us(reconstruction_mr_us)
-        # z_us_mr, z_mu_us_mr, z_sigma_us_mr = self.autoencoderkl_us_mr(z_us)
-        # reconstruction_mr = self.decode_mr(z_us_mr)
-
-        recons_loss_mr = F.l1_loss(reconstruction_mr.float(), x_mr.float())
-        p_loss_mr = self.perceptual_loss(reconstruction_mr.float(), x_mr.float())
-
-
-        kl_loss_mr_us = 0.5 * torch.sum(z_mu_mr_us.pow(2) + z_sigma_mr_us.pow(2) - torch.log(z_sigma_mr_us.pow(2)) - 1, dim=[1, 2, 3])
-        kl_loss_mr_us = torch.sum(kl_loss_mr_us) / kl_loss_mr_us.shape[0]
-
-        kl_loss_us_mr = 0.5 * torch.sum(z_mu_us_mr.pow(2) + z_sigma_us_mr.pow(2) - torch.log(z_sigma_us_mr.pow(2)) - 1, dim=[1, 2, 3])
-        kl_loss_us_mr = torch.sum(kl_loss_us_mr) / kl_loss_us_mr.shape[0]
-
-        kl_loss_mr = kl_loss_mr_us + kl_loss_us_mr
-
-
-        loss_g = recons_loss_mr + (self.hparams.kl_weight * kl_loss_mr) + (self.hparams.perceptual_weight * p_loss_mr)
-        
-
-        reconstruction_us_mr, z_mu_us_mr, z_sigma_us_mr = self.get_mr(x_us)
-        reconstruction_us, z_mu_mr_us, z_sigma_mr_us = self.get_us(reconstruction_us_mr)
-
-
-        recons_loss_us = F.l1_loss(reconstruction_us.float(), x_us.float())
-        p_loss_us = self.perceptual_loss(reconstruction_us.float(), x_us.float())
-        kl_loss_us_mr = 0.5 * torch.sum(z_mu_us_mr.pow(2) + z_sigma_us_mr.pow(2) - torch.log(z_sigma_us_mr.pow(2)) - 1, dim=[1, 2, 3])
-        kl_loss_us_mr = torch.sum(kl_loss_us_mr) / kl_loss_us_mr.shape[0]
-
-        kl_loss_mr_us = 0.5 * torch.sum(z_mu_mr_us.pow(2) + z_sigma_mr_us.pow(2) - torch.log(z_sigma_mr_us.pow(2)) - 1, dim=[1, 2, 3])
-        kl_loss_mr_us = torch.sum(kl_loss_mr_us) / kl_loss_mr_us.shape[0]
-
-        kl_loss_us = kl_loss_us_mr + kl_loss_mr_us
-
-        loss_g += recons_loss_us + (self.hparams.kl_weight * kl_loss_us) + (self.hparams.perceptual_weight * p_loss_us)
-
-
-        if self.trainer.current_epoch > self.hparams.autoencoder_warm_up_n_epochs:
-
-
-            logits_fake_mr = self.discriminator_mr(reconstruction_mr.contiguous().float())[-1]
-            generator_loss_mr = self.adversarial_loss(logits_fake_mr, target_is_real=True, for_discriminator=False)
-            loss_g += self.hparams.adversarial_weight * generator_loss_mr
-
-            logits_fake_mr = self.discriminator_mr(reconstruction_us_mr.contiguous().float())[-1]
-            generator_loss_us_mr = self.adversarial_loss(logits_fake_mr, target_is_real=True, for_discriminator=False)
-            loss_g += self.hparams.adversarial_weight * generator_loss_us_mr
-            
-            logits_fake_us = self.discriminator_us(reconstruction_mr_us.contiguous().float())[-1]
-            generator_loss_mr_us = self.adversarial_loss(logits_fake_us, target_is_real=True, for_discriminator=False)
-            loss_g += self.hparams.adversarial_weight * generator_loss_mr_us
-
-            logits_fake_us = self.discriminator_us(reconstruction_us.contiguous().float())[-1]
-            generator_loss_us = self.adversarial_loss(logits_fake_us, target_is_real=True, for_discriminator=False)
-            loss_g += self.hparams.adversarial_weight * generator_loss_us
-
-
-        loss_g.backward()
-        optimizer_g.step()
-
-
-        loss_d = 0.
-        if self.trainer.current_epoch > self.hparams.autoencoder_warm_up_n_epochs:            
-            
-            optimizer_d.zero_grad()
-
-            logits_fake_mr = self.discriminator_mr(reconstruction_mr.contiguous().detach())[-1]
-            loss_d_fake_mr = self.adversarial_loss(logits_fake_mr, target_is_real=False, for_discriminator=True)
-            logits_real_mr = self.discriminator_mr(x_mr.contiguous().detach())[-1]
-            loss_d_real_mr = self.adversarial_loss(logits_real_mr, target_is_real=True, for_discriminator=True)
-            logits_fake_us_mr = self.discriminator_mr(reconstruction_us_mr.contiguous().detach())[-1]
-            loss_d_fake_us_mr = self.adversarial_loss(logits_fake_us_mr, target_is_real=False, for_discriminator=True)
-            discriminator_loss_mr = (loss_d_fake_mr + loss_d_real_mr + loss_d_fake_us_mr) * 0.5
-
-            logits_fake_us = self.discriminator_us(reconstruction_us.contiguous().detach())[-1]
-            loss_d_fake_us = self.adversarial_loss(logits_fake_us, target_is_real=False, for_discriminator=True)
-            logits_real_us = self.discriminator_us(x_us.contiguous().detach())[-1]
-            loss_d_real_us = self.adversarial_loss(logits_real_us, target_is_real=True, for_discriminator=True)
-            logits_fake_mr_us = self.discriminator_us(reconstruction_mr_us.contiguous().detach())[-1]
-            loss_d_fake_mr_us = self.adversarial_loss(logits_fake_mr_us, target_is_real=False, for_discriminator=True)
-            discriminator_loss_us = (loss_d_fake_us + loss_d_real_us + loss_d_fake_mr_us) * 0.5
-
-            loss_d = self.hparams.adversarial_weight * (discriminator_loss_mr + discriminator_loss_us)
-
-            loss_d.backward()
-            optimizer_d.step()
-
-
-        self.log("train_loss_g", loss_g)
-        self.log("train_loss_d", loss_d)
-
-
-        return {"train_loss_g": loss_g, "train_loss_d": loss_d}
-        
-
-    def validation_step(self, val_batch, batch_idx):
-        x_mr, x_us = val_batch
-        
-        reconstruction_mr_us, z_mu_mr_us, z_sigma_mr_us = self.get_us(x_mr)
-        reconstruction_mr, z_mu_us_mr, z_sigma_us_mr = self.get_mr(reconstruction_mr_us)
-        recon_loss_mr = F.l1_loss(x_mr.float(), reconstruction_mr.float())
-
-
-        reconstruction_us_mr, z_mu_us_mr, z_sigma_us_mr = self.get_mr(x_us)
-        reconstruction_us, z_mu_mr_us, z_sigma_mr_us = self.get_us(reconstruction_us_mr)
-        recon_loss_us = F.l1_loss(x_us.float(), reconstruction_us.float())
-
-        recon_loss = recon_loss_mr + recon_loss_us
-
-        self.log("val_loss", recon_loss, sync_dist=True)
-
-        
-
-
-    def forward(self, images):        
-        return self.get_us(images)
-
-
-class VQVAEPL(pl.LightningModule):
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.save_hyperparameters()
-
-        self.vqvae = nets.VQVAE(
-            spatial_dims=2,
-            in_channels=1,
-            out_channels=1,
-            num_channels=(64, 128, 256, 512, 1024),
-            num_res_channels=512,
-            num_res_layers=2,
-            downsample_parameters=((2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1)),
-            upsample_parameters=((2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0)),
-            num_embeddings=256,
-            embedding_dim=128
-        )
-
-        self.perceptual_loss = PerceptualLoss(spatial_dims=2, network_type="alex")
-
-        self.automatic_optimization = False
-
-        self.discriminator = nets.PatchDiscriminator(spatial_dims=2, num_layers_d=3, num_channels=64, in_channels=1, out_channels=1)        
-
-        self.adv_loss = PatchAdversarialLoss(criterion="least_squares")        
-        self.l1_loss = torch.nn.L1Loss()
-
-        self.adv_weight = 0.01
-        self.perceptual_weight = 0.001
-
-        self.noise_transform = torch.nn.Sequential(
-            GaussianNoise(0.0, 0.05),
-            RandCoarseShuffle(),
-            SaltAndPepper()
-            
-        )
-        
-
-    def configure_optimizers(self):
-        optimizer_g = optim.AdamW(self.vqvae.parameters(),
-                                lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay)
-
-        optimizer_d = optim.AdamW(self.discriminator.parameters(),
-                                lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay)
-
-        return [optimizer_g, optimizer_d]
-
-    def training_step(self, train_batch, batch_idx):
-        x = train_batch
-
-        optimizer_g, optimizer_d = self.optimizers()
-        
-        optimizer_g.zero_grad(set_to_none=True)
-
-        reconstruction, quantization_loss = self.vqvae(images=self.noise_transform(x))
-        logits_fake = self.discriminator(reconstruction.contiguous().float())[-1]
-
-        recons_loss = self.l1_loss(reconstruction.float(), x.float())
-        p_loss = self.perceptual_loss(reconstruction.float(), x.float())
-        generator_loss = self.adv_loss(logits_fake, target_is_real=True, for_discriminator=False)
-        loss_g = recons_loss + quantization_loss + self.perceptual_weight * p_loss + self.adv_weight * generator_loss
-
-        loss_g.backward()
-        optimizer_g.step()
-
-
-        # Discriminator part
-        optimizer_d.zero_grad(set_to_none=True)
-
-        logits_fake = self.discriminator(reconstruction.contiguous().detach())[-1]
-        loss_d_fake = self.adv_loss(logits_fake, target_is_real=False, for_discriminator=True)
-        logits_real = self.discriminator(x.contiguous().detach())[-1]
-        loss_d_real = self.adv_loss(logits_real, target_is_real=True, for_discriminator=True)
-        discriminator_loss = (loss_d_fake + loss_d_real) * 0.5
-
-        loss_d = self.adv_weight * discriminator_loss
-
-        loss_d.backward()
-        optimizer_d.step()
-
-        self.log("train_loss_g", loss_g)
-        self.log("train_loss_d", loss_d)
-
-        return {"train_loss_g": loss_g, "train_loss_d": loss_d}
-        
-
-    def validation_step(self, val_batch, batch_idx):
-        x = val_batch
-
-        reconstruction, quantization_loss = self.vqvae(images=x)
-        recon_loss = self.l1_loss(x.float(), reconstruction.float())
-
-        self.log("val_loss", recon_loss, sync_dist=True)
-
-
-    def forward(self, images):        
-        return self.vqvae(images)
-
-
-
-class VQVAEPLFull(pl.LightningModule):
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.save_hyperparameters()
-
-        self.vqvae = nets.VQVAE(
-            spatial_dims=2,
-            in_channels=1,
-            out_channels=1,
-            num_channels=(64, 128, 256, 512, 1024, 2048),
-            num_res_channels=512,
-            num_res_layers=2,
-            downsample_parameters=((2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1)),
-            upsample_parameters=((2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0)),
-            num_embeddings=256,
-            embedding_dim=128
-        )
-
-        self.perceptual_loss = PerceptualLoss(spatial_dims=2, network_type="alex")
-
-        self.automatic_optimization = False
-
-        self.discriminator = nets.PatchDiscriminator(spatial_dims=2, num_layers_d=3, num_channels=64, in_channels=1, out_channels=1)        
-
-        self.adv_loss = PatchAdversarialLoss(criterion="least_squares")        
-        self.l1_loss = torch.nn.L1Loss()
-
-        self.adv_weight = 0.01
-        self.perceptual_weight = 0.001
-
-        self.noise_transform = torch.nn.Sequential(
-            GaussianNoise(0.0, 0.05),
-            RandCoarseShuffle(),
-            SaltAndPepper()
-            
-        )
-        
-
-    def configure_optimizers(self):
-        optimizer_g = optim.AdamW(self.vqvae.parameters(),
-                                lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay)
-
-        optimizer_d = optim.AdamW(self.discriminator.parameters(),
-                                lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay)
-
-        return [optimizer_g, optimizer_d]
-
-    def training_step(self, train_batch, batch_idx):
-        x = train_batch
-
-        optimizer_g, optimizer_d = self.optimizers()
-        
-        optimizer_g.zero_grad(set_to_none=True)
-
-        reconstruction, quantization_loss = self.vqvae(images=self.noise_transform(x))
-        logits_fake = self.discriminator(reconstruction.contiguous().float())[-1]
-
-        recons_loss = self.l1_loss(reconstruction.float(), x.float())
-        p_loss = self.perceptual_loss(reconstruction.float(), x.float())
-        generator_loss = self.adv_loss(logits_fake, target_is_real=True, for_discriminator=False)
-        loss_g = recons_loss + quantization_loss + self.perceptual_weight * p_loss + self.adv_weight * generator_loss
-
-        loss_g.backward()
-        optimizer_g.step()
-
-
-        # Discriminator part
-        optimizer_d.zero_grad(set_to_none=True)
-
-        logits_fake = self.discriminator(reconstruction.contiguous().detach())[-1]
-        loss_d_fake = self.adv_loss(logits_fake, target_is_real=False, for_discriminator=True)
-        logits_real = self.discriminator(x.contiguous().detach())[-1]
-        loss_d_real = self.adv_loss(logits_real, target_is_real=True, for_discriminator=True)
-        discriminator_loss = (loss_d_fake + loss_d_real) * 0.5
-
-        loss_d = self.adv_weight * discriminator_loss
-
-        loss_d.backward()
-        optimizer_d.step()
-
-        self.log("train_loss_g", loss_g)
-        self.log("train_loss_d", loss_d)
-
-        return {"train_loss_g": loss_g, "train_loss_d": loss_d}
-        
-
-    def validation_step(self, val_batch, batch_idx):
-        x = val_batch
-
-        reconstruction, quantization_loss = self.vqvae(images=x)
-        recon_loss = self.l1_loss(x.float(), reconstruction.float())
-
-        self.log("val_loss", recon_loss, sync_dist=True)
-
-
-    def forward(self, images):        
-        return self.vqvae(images)
-
-
-
-class GanKL(pl.LightningModule):
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.save_hyperparameters()
-
-        vqvae = nets.VQVAE(
-            spatial_dims=2,
-            in_channels=1,
-            out_channels=3,
-            num_channels=(8, 16, 32, 64, 256, 512),
-            num_res_channels=256,
-            num_res_layers=1,
-            downsample_parameters=((2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1), (2, 4, 1, 1)),
-            upsample_parameters=((2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0), (2, 4, 1, 1, 0)),
-            num_embeddings=256,
-            embedding_dim=self.hparams.emb_dim
-        )
-
-        self.decoder = vqvae.decoder
-        self.quantizer = vqvae.quantizer
-
-        # self.perceptual_loss = PerceptualLoss(spatial_dims=2, network_type="alex")
-
-        self.automatic_optimization = False
-
-        self.discriminator = nets.PatchDiscriminator(spatial_dims=2, num_layers_d=3, num_channels=64, in_channels=3, out_channels=3)        
-
-        self.adversarial_loss = PatchAdversarialLoss(criterion="least_squares")
-        
-
-    def configure_optimizers(self):
-        optimizer_g = optim.AdamW(self.decoder.parameters(),
-                                lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay)
-
-        optimizer_d = optim.AdamW(self.discriminator.parameters(),
-                                lr=self.hparams.lr_d,
-                                weight_decay=self.hparams.weight_decay)
-
-        return [optimizer_g, optimizer_d]
-
-    def sampling(self, z_mu: torch.Tensor, z_sigma: torch.Tensor) -> torch.Tensor:
-        """
-        From the mean and sigma representations resulting of encoding an image through the latent space,
-        obtains a noise sample resulting from sampling gaussian noise, multiplying by the variance (sigma) and
-        adding the mean.
-
-        Args:
-            z_mu: Bx[Z_CHANNELS]x[LATENT SPACE SIZE] mean vector obtained by the encoder when you encode an image
-            z_sigma: Bx[Z_CHANNELS]x[LATENT SPACE SIZE] variance vector obtained by the encoder when you encode an image
-
-        Returns:
-            sample of shape Bx[Z_CHANNELS]x[LATENT SPACE SIZE]
-        """
+        elif not hasattr(self, 'grid_t'):
+            # Load tensors directly from the current directory
+            self.grid_t = torch.load(grid_t_file).to(self.device)
+            self.inverse_grid_t = torch.load(inverse_grid_t_file).to(self.device)
+            self.mask_fan_t = torch.load(mask_fan_t_file).to(self.device)
+
+    def sampling(self, z_mu: torch.Tensor, z_sigma: torch.Tensor) -> torch.Tensor:        
         eps = torch.randn_like(z_sigma)
         z_vae = z_mu + eps * z_sigma
         return z_vae
     
+    def compute_loss(self, X, X_hat, step="train", sync_dist=False):
 
-    def training_step(self, train_batch, batch_idx):
-        z_mu = train_batch["z_mu"]
-        z_sigma = train_batch["z_sigma"]
-
-        z_vae = self.sampling(z_mu, z_sigma)
-
-
-        optimizer_g, optimizer_d = self.optimizers()
+        # Negative ELBO of P(X|z)
+        loss = self.loss_fn(X, X_hat)
         
-        optimizer_g.zero_grad()
-
-
-        fake, x_loss = self(z_vae.shape[0])
-        
-        logits_fake = self.discriminator(fake.contiguous().float())[-1]
-        generator_loss = self.adversarial_loss(logits_fake, target_is_real=True, for_discriminator=False)
-        loss_g = generator_loss + x_loss
-
-        loss_g.backward()
-        optimizer_g.step()       
-
-        loss_d = 0.
-        
-        optimizer_d.zero_grad()
-
-        logits_fake = self.discriminator(fake.contiguous().detach())[-1]
-        loss_d_fake = self.adversarial_loss(logits_fake, target_is_real=False, for_discriminator=True)
-        logits_real = self.discriminator(z_vae.contiguous().detach())[-1]
-        loss_d_real = self.adversarial_loss(logits_real, target_is_real=True, for_discriminator=True)
-        discriminator_loss = (loss_d_fake + loss_d_real) * 0.5
-
-        loss_d = discriminator_loss
-
-        loss_d.backward()
-        optimizer_d.step()
-
-        self.log("train_loss_g", loss_g)
-        self.log("train_loss_d", loss_d)
-
-        return {"train_loss_g": loss_g, "train_loss_d": loss_d}
-
-    def validation_step(self, val_batch, batch_idx):
-
-        z_mu = val_batch["z_mu"]
-        z_sigma = val_batch["z_sigma"]
-
-        z_vae = self.sampling(z_mu, z_sigma)
-
-        fake, x_loss = self(z_vae.shape[0])
-        
-        logits_fake = self.discriminator(fake.contiguous().float())[-1]
-        generator_loss = self.adversarial_loss(logits_fake, target_is_real=True, for_discriminator=False)
-        loss_g = generator_loss
-
-        logits_fake = self.discriminator(fake.contiguous().detach())[-1]
-        loss_d_fake = self.adversarial_loss(logits_fake, target_is_real=False, for_discriminator=True)
-        logits_real = self.discriminator(z_vae.contiguous().detach())[-1]
-        loss_d_real = self.adversarial_loss(logits_real, target_is_real=True, for_discriminator=True)
-        discriminator_loss = (loss_d_fake + loss_d_real) * 0.5
-
-        loss_d = discriminator_loss        
-
-        self.log("val_loss_g", loss_g, sync_dist=True)
-        self.log("val_loss_d", loss_d, sync_dist=True)
-        self.log("val_loss", loss_d + loss_g, sync_dist=True)
-
-
-    def forward(self, num):
-        x = torch.randn(num, self.hparams.emb_dim, 1, 1).to(self.device)
-        x_loss, x = self.quantizer(x)
-        return self.decoder(x), x_loss
-
-        
-
-class DDPMPL(pl.LightningModule):
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.save_hyperparameters()
-
-        in_channels = 3
-        if hasattr(self.hparams, "in_channels"):
-            in_channels = self.hparams.in_channels
-
-        out_channels = 3
-        if hasattr(self.hparams, "out_channels"):
-            out_channels = self.hparams.out_channels
-        
-        self.model = nets.DiffusionModelUNet(
-            spatial_dims=2,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            num_channels=(128, 256, 256),
-            attention_levels=(False, True, True),
-            num_res_blocks=1,
-            num_head_channels=256,
-        )
-
-        if hasattr(self.hparams, "use_pre_trained") and self.hparams.use_pre_trained:
-            model = torch.hub.load("marksgraham/pretrained_generative_models:v0.2", model="ddpm_2d", verbose=True)
-
-
-        self.scheduler = DDPMScheduler(num_train_timesteps=self.hparams.num_train_timesteps)
-        self.inferer = DiffusionInferer(self.scheduler)
-        
-
-    def configure_optimizers(self):
-        optimizer = optim.AdamW(self.parameters(),
-                                lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay)
-        
-        return optimizer
-    
-
-    def training_step(self, train_batch, batch_idx):
-
-        images = train_batch
-
-        noise = torch.randn_like(images)
-
-        # Create timesteps
-        timesteps = torch.randint(
-            0, self.inferer.scheduler.num_train_timesteps, (images.shape[0],), device=self.device
-        ).long()
-
-        # Get model prediction
-        noise_pred = self.inferer(inputs=images, diffusion_model=self.model, noise=noise, timesteps=timesteps)
-
-        loss = F.mse_loss(noise_pred.float(), noise.float())
-
-        self.log("train_loss", loss)
+        self.log(f"{step}_loss", loss, sync_dist=sync_dist)
 
         return loss
 
-    def validation_step(self, val_batch, batch_idx):
-
-        images = val_batch
-
-        noise = torch.randn_like(images)
-
-        # Create timesteps
-        timesteps = torch.randint(
-            0, self.inferer.scheduler.num_train_timesteps, (images.shape[0],), device=self.device
-        ).long()
-
-        # Get model prediction
-        noise_pred = self.inferer(inputs=images, diffusion_model=self.model, noise=noise, timesteps=timesteps)
-
-        loss = F.mse_loss(noise_pred.float(), noise.float())
-
-
-        self.log("val_loss", loss, sync_dist=True)
-
-
-    def forward(self, x):
-
-        noise = torch.randn_like(x).to(self.device)
-
-        self.scheduler.set_timesteps(num_inference_steps=self.hparams.num_train_timesteps)        
-
-        return self.inferer.sample(input_noise=noise, diffusion_model=self.model, scheduler=self.scheduler, verbose=False)
-
-class DDPMPL64(pl.LightningModule):
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.save_hyperparameters()
-
-        in_channels = 3
-        if hasattr(self.hparams, "in_channels"):
-            in_channels = self.hparams.in_channels
-
-        out_channels = 3
-        if hasattr(self.hparams, "out_channels"):
-            out_channels = self.hparams.out_channels
-        
-        self.model = nets.DiffusionModelUNet(
-            spatial_dims=2,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            num_channels=(128, 256, 256),
-            attention_levels=(False, True, True),
-            num_res_blocks=1,
-            num_head_channels=256,
-        )
-
-        if hasattr(self.hparams, "use_pre_trained") and self.hparams.use_pre_trained:
-            model = torch.hub.load("marksgraham/pretrained_generative_models:v0.2", model="ddpm_2d", verbose=True)
-
-
-        self.resize_transform = transforms.Resize([-1, 64, 64])
-        self.scheduler = DDPMScheduler(num_train_timesteps=self.hparams.num_train_timesteps)
-        self.inferer = DiffusionInferer(self.scheduler)
-        
-
-    def configure_optimizers(self):
-        optimizer = optim.AdamW(self.parameters(),
-                                lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay)
-        
-        return optimizer
-    
-
-    def training_step(self, train_batch, batch_idx):
-
-        images = train_batch
-        images = self.resize_transform(images)
-
-        noise = torch.randn_like(images)
-
-        # Create timesteps
-        timesteps = torch.randint(
-            0, self.inferer.scheduler.num_train_timesteps, (images.shape[0],), device=self.device
-        ).long()
-
-        # Get model prediction
-        noise_pred = self.inferer(inputs=images, diffusion_model=self.model, noise=noise, timesteps=timesteps)
-
-        loss = F.mse_loss(noise_pred.float(), noise.float())
-
-        self.log("train_loss", loss)
-
-        return loss
-
-    def validation_step(self, val_batch, batch_idx):
-
-        images = val_batch
-        images = self.resize_transform(images)
-
-        noise = torch.randn_like(images)
-
-        # Create timesteps
-        timesteps = torch.randint(
-            0, self.inferer.scheduler.num_train_timesteps, (images.shape[0],), device=self.device
-        ).long()
-
-        # Get model prediction
-        noise_pred = self.inferer(inputs=images, diffusion_model=self.model, noise=noise, timesteps=timesteps)
-
-        loss = F.mse_loss(noise_pred.float(), noise.float())
-
-
-        self.log("val_loss", loss, sync_dist=True)
-
-
-    def forward(self, x):
-
-        noise = torch.randn_like(self.resize_transform(x)).to(self.device)
-
-        self.scheduler.set_timesteps(num_inference_steps=self.hparams.num_train_timesteps)        
-
-        return self.inferer.sample(input_noise=noise, diffusion_model=self.model, scheduler=self.scheduler, verbose=False)
-
-
-class DDPMPL64_ddim(pl.LightningModule):
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.save_hyperparameters()
-
-        in_channels = 3
-        if hasattr(self.hparams, "in_channels"):
-            in_channels = self.hparams.in_channels
-
-        out_channels = 3
-        if hasattr(self.hparams, "out_channels"):
-            out_channels = self.hparams.out_channels
-        
-        self.model = nets.DiffusionModelUNet(
-            spatial_dims=2,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            num_channels=(128, 256, 256),
-            attention_levels=(False, True, True),
-            num_res_blocks=1,
-            num_head_channels=256,
-        )
-
-        if hasattr(self.hparams, "use_pre_trained") and self.hparams.use_pre_trained:
-            model = torch.hub.load("marksgraham/pretrained_generative_models:v0.2", model="ddpm_2d", verbose=True)
-
-
-        self.resize_transform = transforms.Resize([-1, 64, 64])
-        self.scheduler = DDIMScheduler(num_train_timesteps=self.hparams.num_train_timesteps)
-        self.inferer = DiffusionInferer(self.scheduler)
-        
-
-    def configure_optimizers(self):
-        optimizer = optim.AdamW(self.parameters(),
-                                lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay)
-        
-        return optimizer
-    
-
-    def training_step(self, train_batch, batch_idx):
-
-        images = train_batch
-        images = self.resize_transform(images)
-
-        noise = torch.randn_like(images)
-
-        # Create timesteps
-        timesteps = torch.randint(
-            0, self.inferer.scheduler.num_train_timesteps, (images.shape[0],), device=self.device
-        ).long()
-
-        # Get model prediction
-        noise_pred = self.inferer(inputs=images, diffusion_model=self.model, noise=noise, timesteps=timesteps)
-
-        loss = F.mse_loss(noise_pred.float(), noise.float())
-
-        self.log("train_loss", loss)
-
-        return loss
-
-    def validation_step(self, val_batch, batch_idx):
-
-        images = val_batch
-        images = self.resize_transform(images)
-
-        noise = torch.randn_like(images)
-
-        # Create timesteps
-        timesteps = torch.randint(
-            0, self.inferer.scheduler.num_train_timesteps, (images.shape[0],), device=self.device
-        ).long()
-
-        # Get model prediction
-        noise_pred = self.inferer(inputs=images, diffusion_model=self.model, noise=noise, timesteps=timesteps)
-
-        loss = F.mse_loss(noise_pred.float(), noise.float())
-
-
-        self.log("val_loss", loss, sync_dist=True)
-
-
-    def forward(self, x):
-
-        noise = torch.randn_like(self.resize_transform(x)).to(self.device)
-
-        self.scheduler.set_timesteps(num_inference_steps=self.hparams.num_train_timesteps)        
-
-        return self.inferer.sample(input_noise=noise, diffusion_model=self.model, scheduler=self.scheduler, verbose=False)
-
-
-class ProjectionHead(nn.Module):
-    def __init__(self, input_dim=1280, hidden_dim=1280, output_dim=128):
-        super().__init__()
-        self.output_dim = output_dim
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-
-        self.model = nn.Sequential(
-            nn.Linear(self.input_dim, self.hidden_dim),
-            nn.BatchNorm1d(self.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(self.hidden_dim, self.output_dim, bias=False)
-        )
-
-    def forward(self, x):
-        x = self.model(x)  
-        x = torch.abs(x)      
-        return F.normalize(x, dim=1)
-
-class Diffusion_AE(pl.LightningModule):
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.save_hyperparameters()
-
-        self.unet = nets.DiffusionModelUNet(
-                    spatial_dims=2,
-                    in_channels=1,
-                    out_channels=1,
-                    num_channels=(128, 256, 256),
-                    attention_levels=(False, True, True),
-                    num_res_blocks=1,
-                    num_head_channels=64,
-                    with_conditioning=True,
-                    cross_attention_dim=1,
-                )
-        
-        if hasattr(self.hparams, 'base_encoder'):
-            # template_model = getattr(torchvision.models, self.hparams.base_encoder)
-            # self.semantic_encoder = template_model(num_classes=4*self.hparams.emb_dim)
-
-            template_model = getattr(monai.networks.nets, self.hparams.base_encoder)
-            model_params = eval('dict(%s)' % self.hparams.base_encoder_params.replace(' ',''))
-            self.semantic_encoder = template_model(**model_params)
+    def volume_sampling(self, X, X_origin, X_end, use_random=False):
+        with torch.no_grad():
+            simulator = self.simu0
             
-            if hasattr(self.semantic_encoder, 'classifier'):
-                self.semantic_encoder.classifier = nn.Sequential(
-                    self.semantic_encoder.classifier,
-                    ProjectionHead(input_dim=4*self.hparams.emb_dim, hidden_dim=self.hparams.hidden_dim, output_dim=self.hparams.emb_dim)
-                )            
+            grid = None
+            inverse_grid = None
+            mask_fan = None
 
-            elif hasattr(self.semantic_encoder, 'fc'):
+            tags = self.vs.tags
+
+            if use_random:
+
+                simulator_idx = np.random.choice([0, 1, 2, 3, 4], replace=False)
+                simulator = getattr(self, f'simu{simulator_idx}')
+
+                if self.hparams.num_random_sweeps > 0:
+                    tags = np.random.choice(self.vs.tags, self.hparams.num_random_sweeps)
+                else:
+                    tags = self.vs.tags
+
+                grid_idx = torch.randint(low=0, high=self.hparams.n_grids - 1, size=(1,))
             
-                self.semantic_encoder.fc = nn.Sequential(
-                    self.semantic_encoder.fc,  # Linear(ResNet output, 4*hidden_dim)
-                    ProjectionHead(input_dim=4*self.hparams.emb_dim, hidden_dim=self.hparams.hidden_dim, output_dim=self.hparams.emb_dim)
-                )
+                grid = self.grid_t[grid_idx]
+                inverse_grid = self.inverse_grid_t[grid_idx]
+                mask_fan = self.mask_fan_t[grid_idx] 
+
+            X_sweeps = []
+            X_sweeps_tags = []            
+
+            for tag in tags:                
+                
+                sampled_sweep_simu = self.vs.get_sweep(X, X_origin, X_end, tag, use_random=use_random, simulator=simulator, grid=grid, inverse_grid=inverse_grid, mask_fan=mask_fan)
+                X_sweeps.append(sampled_sweep_simu)
+                X_sweeps_tags.append(self.vs.tags_dict[tag])
+                
+            X_sweeps = torch.cat(X_sweeps, dim=1)
+            X_sweeps_tags = torch.tensor(X_sweeps_tags).repeat(X_sweeps.shape[0], 1)
+
+            return X_sweeps, X_sweeps_tags
+
+    def positional_encoding(self, z, sweeps_tags):
+        # Positional encoding for training only. Ensure the encoding is done in the correct order depending on the sweep
+        # Define shapes
+        BS, N, C, F = z.shape # [BS, N, self.hparams.n_chunks, 64*64*self.hparams.latent_channels]
+        max_N = len(self.vs.tags)
+        
+        buffer = torch.zeros((BS, max_N, C, F), dtype=torch.float32, device=self.device)  # Buffer for data
+
+        # Scatter data into the buffer
+        for b in range(BS):
+            buffer[b, sweeps_tags[b]] = z[b]
+
+        buffer = self.p_encoding(buffer)
+        
+        # Assign output in tensor
+        for b in range(BS):
+            z[b] = buffer[b, sweeps_tags[b]]
+
+        return z
+
+    def training_step(self, train_batch, batch_idx):
+        X, X_origin, X_end, X_PC = train_batch
+
+        X, rotation_matrices = self.vs.random_rotate_3d_batch(X)
+
+        batch_size = X.shape[0]
+
+        if  torch.rand(1).item() < self.hparams.z_prob:
+            z = torch.zeros(batch_size, 1, self.hparams.embed_dim, device=self.device)
         else:
-            self.semantic_encoder = torchvision.models.resnet18()
-            self.semantic_encoder.conv1 = torch.nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-            self.semantic_encoder.fc = torch.nn.Linear(512, self.hparams.emb_dim)
+            
 
-        self.scheduler = DDIMScheduler(num_train_timesteps=1000)
+            x_sweeps, sweeps_tags = self.volume_sampling(X, X_origin, X_end, use_random=True)
+
+            # x_sweeps shape is B, N, C, T, H, W. N for number of sweeps ex. torch.Size([2, 2, 1, 200, 256, 256])
+            # tags shape torch.Size([2, 2])
+            Nsweeps = x_sweeps.shape[1] # Number of sweeps -> T
+            
+            z = []
+            x_v = []
+
+            for n in range(Nsweeps):
+                x_sweeps_n = x_sweeps[:, n, :, :, :, :] # [BS, C, T, H, W]
+                sweeps_tags_n = sweeps_tags[:, n]
+                
+                z_mu, z_sigma = self.encode(x_sweeps_n)            
+                z_ = self.sampling(z_mu, z_sigma) 
+
+                z_ = self.attn_chunk(z_) # [BS, self.hparams.latent_channels, self.hparams.n_chunks, 64. 64]
+
+                z_ = z_.permute(0, 2, 3, 4, 1).reshape(batch_size, self.hparams.n_chunks, -1) # [BS, self.hparams.n_chunks, 64*64*self.hparams.latent_channels]
+
+                z.append(z_.unsqueeze(1))
+
+            z = torch.cat(z, dim=1) # [BS, N, self.hparams.n_chunks, 64*64*self.hparams.latent_channels]
+
+            z = self.proj(z) # [BS, N, self.hparams.n_chunks, 1280]
+
+            z = self.positional_encoding(z, sweeps_tags)
+            z = z.view(batch_size, -1, self.hparams.embed_dim).contiguous()
+            z = self.dropout(z)
+
+        # Diffusion stage
+
+        X_PC = self.vs.apply_batch_rotation(X_PC, rotation_matrices[:,0:3,0:3])
+
+        noise = torch.randn_like(X_PC).to(self.device)
+
+        timesteps = torch.randint(0, self.hparams.num_train_steps - 1, (X_PC.shape[0],)).long().to(self.device)
+
+        noisy_X = self.noise_scheduler.add_noise(X_PC, noise=noise, timesteps=timesteps)
+
+        X_hat = self(noisy_X.permute(0, 2, 1).view(-1, 3, 64, 64).contiguous(), timesteps=timesteps, context=z)
+        X_hat = X_hat.view(-1, 3, 64*64).permute(0, 2, 1).contiguous()
+
+        return self.compute_loss(X=noise, X_hat=X_hat)
         
-        self.inferer = DiffusionInferer(self.scheduler)
 
-    # def forward(self, xt, x_cond, t=100):
-    #     latent = self.semantic_encoder(x_cond)
-    #     noise_pred = self.unet(x=xt, timesteps=t, context=latent.unsqueeze(2))
-    #     return noise_pred, latent
-
-    def forward(self, x, timesteps=100):
-        scheduler = DDIMScheduler()
-        scheduler.set_timesteps(num_inference_steps=timesteps)        
-        noise = torch.randn_like(x).to(self.device)
-        latent = self.semantic_encoder(x)
-        return self.inferer.sample(input_noise=noise, diffusion_model=self.unet, scheduler=scheduler, save_intermediates=False, conditioning=latent.unsqueeze(2), verbose=False)        
+    def validation_step(self, val_batch, batch_idx):
         
+        X, X_origin, X_end, X_PC = val_batch
 
+        x_sweeps, sweeps_tags = self.volume_sampling(X, X_origin, X_end)
+
+        # x_sweeps shape is B, N, C, T, H, W. N for number of sweeps ex. torch.Size([2, 2, 1, 200, 256, 256]) 
+        # tags shape torch.Size([2, 2])
+
+        batch_size = x_sweeps.shape[0]
+        Nsweeps = x_sweeps.shape[1] # Number of sweeps -> T
+        
+        z = []
+        x_v = []
+
+        for n in range(Nsweeps):
+            x_sweeps_n = x_sweeps[:, n, :, :, :, :] # [BS, C, T, H, W]
+            sweeps_tags_n = sweeps_tags[:, n]
+
+            z_mu, z_sigma = self.encode(x_sweeps_n)
+            z_ = z_mu
+
+            z_ = self.attn_chunk(z_) # [BS, self.hparams.latent_channels, self.hparams.n_chunks, 64. 64]
+
+            z_ = z_.permute(0, 2, 3, 4, 1).reshape(batch_size, self.hparams.n_chunks, -1) # [BS, self.hparams.n_chunks, 64*64*self.hparams.latent_channels]
+
+            z.append(z_.unsqueeze(1))
+
+        z = torch.cat(z, dim=1) # [BS, N, self.hparams.n_chunks, 64*64*self.hparams.latent_channels]
+
+        z = self.proj(z) # [BS, N, elf.hparams.n_chunks, 1280]
+
+        # We don't need to do the trick of using the buffer for the positional encoding here, ALL the sweeps are present in validation
+        z = self.p_encoding(z)
+        z = z.view(batch_size, -1, self.hparams.embed_dim).contiguous()
+
+        # Diffusion stage
+        noise = torch.randn_like(X_PC).to(self.device)
+
+        timesteps = torch.randint(0, self.hparams.num_train_steps - 1, (X_PC.shape[0],)).long().to(self.device)
+
+        noisy_X = self.noise_scheduler.add_noise(X_PC, noise=noise, timesteps=timesteps)
+
+        X_hat = self(noisy_X.permute(0, 2, 1).view(-1, 3, 64, 64).contiguous(), timesteps=timesteps, context=z)
+        X_hat = X_hat.view(-1, 3, 64*64).permute(0, 2, 1).contiguous()
+
+        return self.compute_loss(X=noise, X_hat=X_hat, step="val", sync_dist=True)
+
+    def encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        
+        """
+        Forwards an image through the spatial encoder, obtaining the latent mean and sigma representations.
+
+        Args:
+            x: BxCx[SPATIAL DIMS] tensor
+
+        """
+        h = []
+        for x_chunk in x.chunk(self.hparams.n_chunks_e, dim=2):
+            h.append(self.encoder(x_chunk))
+        h = torch.cat(h, dim=2)
+
+        z_mu = self.quant_conv_mu(h)
+        z_log_var = self.quant_conv_log_sigma(h)
+        z_log_var = torch.clamp(z_log_var, -30.0, 20.0)
+        z_sigma = torch.exp(z_log_var / 2)
+
+        return z_mu, z_sigma
+
+    def forward(self, x: torch.tensor, timesteps: Union[torch.Tensor, float, int], context: torch.Tensor | None = None):
+
+        if not torch.is_tensor(timesteps):
+            timesteps = torch.tensor([timesteps], dtype=torch.long, device=self.device)
+        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
+            timesteps = timesteps[None].to(self.device)
+
+        if timesteps.shape[0] != x.shape[0]:
+            timesteps = timesteps.repeat(x.shape[0])
+            
+        return self.diffnet(sample=x, timestep=timesteps, encoder_hidden_states=context).sample
+
+    def sample(self, num_samples=1, intermediate_steps=None, z=None):
+        intermediates = []
+
+        X_t = torch.randn(num_samples, self.hparams.num_samples, self.hparams.input_dim).to(self.device)        
+
+        for i, t in enumerate(self.noise_scheduler.timesteps):
+
+            
+            x_hat = self(X_t.permute(0, 2, 1).view(-1, self.hparams.input_dim, 64, 64).contiguous(), timesteps=t, context=z)  
+            x_hat = x_hat.view(-1, self.hparams.input_dim, 64*64).permute(0, 2, 1).contiguous()
+
+            # Update sample with step
+            X_t = self.noise_scheduler.step(model_output=x_hat, timestep=t, sample=X_t).prev_sample
+            # X_t = X_t.clone().detach()
+            if intermediate_steps is not None and intermediate_steps > 0 and t % (self.hparams.num_train_steps//intermediate_steps) == 0:
+                intermediates.append(X_t)
+
+        return X_t, intermediates
+
+    def sample_guided(self, num_samples=1, guidance_scale=7.5, intermediate_steps=None, z=None):
+        intermediates = []
+
+        # Initialize random noise
+        device = self.device
+        x_t = torch.randn(num_samples, 64*64, self.hparams.input_dim, device=device)
+
+        for t in reversed(range(self.hparams.num_train_steps)):
+            
+            # Conditional prediction (with context)
+            x_cond = self(
+                x_t.permute(0, 2, 1).view(-1, self.hparams.input_dim, 64, 64).contiguous(),
+                timesteps=t,
+                context=z
+            )
+            x_cond = x_cond.view(-1, self.hparams.input_dim, 64*64).permute(0, 2, 1)
+
+            # Unconditional prediction (without context)
+            x_uncond = self(
+                x_t.permute(0, 2, 1).view(-1, self.hparams.input_dim, 64, 64).contiguous(),
+                timesteps=t,
+                context=torch.zeros(num_samples, 1, self.hparams.embed_dim, device=device)
+            )
+            x_uncond = x_uncond.view(-1, self.hparams.input_dim, 64*64).permute(0, 2, 1).contiguous()
+
+            # Perform classifier-free guidance
+            x_guided = x_uncond + guidance_scale * (x_cond - x_uncond)
+
+            # Update the diffusion step using guided output
+            x_t = self.noise_scheduler.step(model_output=x_guided, t=t, sample=x_t)
+
+            # Save intermediate steps if needed
+            if intermediate_steps and t % (self.hparams.num_train_steps // intermediate_steps) == 0:
+                intermediates.append(x_t)
+
+        return x_t, intermediates
+
+    # Given diffusion model: model(x, t, cond)
+# x: noisy input at timestep t
+# cond: conditional information, cond=None is unconditional
+
+def guided_sampling(model, x_t, t, cond, guidance_scale):
+    # Predict noise conditioned on cond
+    eps_cond = model(x_t, t, cond)
+    
+    # Predict noise without conditioning (unconditional)
+    eps_uncond = model(x_t, t, cond=None)
+    
+    # Perform classifier-free guidance
+    eps_guided = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+    
+    return eps_guided
+
+
+class USBabyFrame(LightningModule):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.vs = VolumeSamplingBlindSweep()
+        
+        encoder = monai.networks.nets.EfficientNetBN('efficientnet-b0', spatial_dims=2, in_channels=self.hparams.in_channels, num_classes=self.hparams.features)
+        self.encoder = TimeDistributed(encoder, time_dim=2)
+
+        p_encoding = torch.stack([self.positional_encoding(self.hparams.time_steps, self.hparams.features, tag) for tag in self.vs.tags_dict.values()])        
+        self.register_buffer("p_encoding", p_encoding)
+        
+        self.proj = ProjectionHead(input_dim=self.hparams.features, hidden_dim=self.hparams.features, output_dim=self.hparams.embed_dim, activation=nn.LeakyReLU)
+        self.attn_chunk = AttentionChunk(input_dim=self.hparams.embed_dim, hidden_dim=64, chunks=self.hparams.n_chunks)
+
+        self.dropout = nn.Dropout(self.hparams.dropout)
+        
+        # 
+        # self.mha = nn.MultiheadAttention(embed_dim=self.hparams.embed_dim, num_heads=self.hparams.num_heads, dropout=self.hparams.dropout, bias=False, batch_first=True)
+        self.mha = MHAContextModulated(embed_dim=self.hparams.embed_dim, num_heads=self.hparams.num_heads, output_dim=self.hparams.embed_dim, dropout=self.hparams.dropout)
+        
+        # MHAContextModulated(embed_dim=self.hparams.embed_dim, num_heads=self.hparams.num_heads, output_dim=self.hparams.embed_dim, dropout=self.hparams.dropout)
+        self.attn = SelfAttention(input_dim=self.hparams.embed_dim, hidden_dim=64)
+        self.proj_final = ProjectionHead(input_dim=self.hparams.embed_dim, hidden_dim=64, output_dim=9, activation=nn.Tanh)        
+
+        self.simu0 = TimeDistributed(us_simulation_jit.MergedLinearCutLabel11(), time_dim=2)
+        self.simu1 = TimeDistributed(us_simulation_jit.MergedCutLabel11(), time_dim=2)
+        self.simu2 = TimeDistributed(us_simulation_jit.MergedUSRLabel11(), time_dim=2)
+        self.simu3 = TimeDistributed(us_simulation_jit.MergedLinearLabel11(), time_dim=2)
+        self.simu4 = TimeDistributed(us_simulation_jit.MergedLinearLabel11WOG(), time_dim=2)
+        
+        belly_idx = np.load(self.hparams.belly_idx)
+        self.register_buffer("belly_idx", torch.tensor(belly_idx, dtype=torch.long))
+        head_idx = np.load(self.hparams.head_idx)        
+        self.register_buffer("head_idx", torch.tensor(head_idx, dtype=torch.long))
+        side_idx = np.load(self.hparams.side_idx)
+        self.register_buffer("side_idx", torch.tensor(side_idx, dtype=torch.long))
+
+        self.loss_fn = nn.CosineSimilarity(dim=2)
+        # self.loss_fn = nn.MSELoss()
+
+        
+    
+    @staticmethod
+    def add_model_specific_args(parent_parser):
+        group = parent_parser.add_argument_group("Calculate baby frame of orientation")
+
+        group.add_argument("--lr", type=float, default=1e-4)
+        group.add_argument('--weight_decay', help='Weight decay for optimizer', type=float, default=0.01)
+        
+        # Image Encoder parameters 
+        group.add_argument("--spatial_dims", type=int, default=2, help='Spatial dimensions for the encoder')
+        group.add_argument("--in_channels", type=int, default=1, help='Input channels for encoder')
+        group.add_argument("--features", type=int, default=1280, help='Number of output features for the encoder')        
+        group.add_argument("--n_chunks_e", type=int, default=16, help='Number of chunks in the encoder stage to reduce memory usage')
+        group.add_argument("--n_chunks", type=int, default=16, help='Number of outputs in the time dimension')
+        group.add_argument("--num_heads", type=int, default=8, help='Number of heads for multi_head attention')
+
+        # Encoder parameters for the diffusion model
+        group.add_argument("--num_samples", type=int, default=4096, help='Number of samples to take from the mesh to start the encoding')
+        group.add_argument("--input_dim", type=int, default=3, help='Input dimension for the encoder')
+        group.add_argument("--embed_dim", type=int, default=128, help='Embedding dimension')
+        group.add_argument("--output_dim", type=int, default=3, help='Output dimension of the model')
+        group.add_argument("--dropout", type=float, default=0.25, help='Dropout rate')
+        
+        
+        group.add_argument("--time_steps", type=int, default=96, help='Number of time steps in the sweep or sequence length')
+        group.add_argument("--num_random_sweeps", type=int, default=3, help='How many random sweeps to use. 0 == all')
+        group.add_argument("--n_grids", type=int, default=200, help='Number of grids')
+        group.add_argument("--belly_idx", type=str, default='/mnt/raid/C1_ML_Analysis/simulated_data_export/fetus_rest_selected/belly_idx.npy', help='Indices for belly')
+        group.add_argument("--head_idx", type=str, default='/mnt/raid/C1_ML_Analysis/simulated_data_export/fetus_rest_selected/head_idx.npy', help='Indices for head')
+        group.add_argument("--side_idx", type=str, default='/mnt/raid/C1_ML_Analysis/simulated_data_export/fetus_rest_selected/side_idx.npy', help='Indices for side')
+        
+        
+        # group.add_argument("--p_ids", type=int, nargs='+', default=[1470, 3369, 2043], help='Point ids to compute the orthogonal orientation frame')
+        # group.add_argument("--target_label", type=int, default=7, help='Target label')
+
+        # group.add_argument("--n_fixed_samples", type=int, default=12288, help='Number of fixed samples')
+
+        return parent_parser
+    
+    def positional_encoding(self, seq_len: int, d_model: int, tag: int) -> torch.Tensor:
+        """
+        Sinusoidal positional encoding with tag-based offset.
+
+        Args:
+            seq_len (int): Sequence length.
+            d_model (int): Embedding dimension.
+            tag (int): Unique tag for the sequence.
+            device (str): Device to store the tensor.
+
+        Returns:
+            torch.Tensor: Positional encoding (seq_len, d_model).
+        """
+        pe = torch.zeros(seq_len, d_model)
+        
+        # Offset positions by a tag-dependent amount to make each sequence encoding unique
+        position = torch.arange(tag * seq_len, (tag + 1) * seq_len, dtype=torch.float32).unsqueeze(1)
+
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        return pe
+    
     def configure_optimizers(self):
         optimizer = optim.AdamW(self.parameters(),
                                 lr=self.hparams.lr,
                                 weight_decay=self.hparams.weight_decay)
-        
         return optimizer
-    
 
-    def training_step(self, train_batch, batch_idx):
+    def on_fit_start(self):        
 
-        images = train_batch
+        # Define the file names directly without using out_dir
+        grid_t_file = 'grid_t.pt'
+        inverse_grid_t_file = 'inverse_grid_t.pt'
+        mask_fan_t_file = 'mask_fan_t.pt'
 
-        batch_size = images.shape[0]
+        if not os.path.exists(grid_t_file):
+            grid_tensor = []
+            inverse_grid_t = []
+            mask_fan_t = []
+
+            for i in range(self.hparams.n_grids):
+
+                grid_w, grid_h = self.hparams.grid_w, self.hparams.grid_h
+                center_x = self.hparams.center_x
+                r1 = self.hparams.r1
+
+                center_y = self.hparams.center_y_start + (self.hparams.center_y_end - self.hparams.center_y_start) * (torch.rand(1))
+                r2 = self.hparams.r2_start + ((self.hparams.r2_end - self.hparams.r2_start) * torch.rand(1)).item()
+                theta = self.hparams.theta_start + ((self.hparams.theta_end - self.hparams.theta_start) * torch.rand(1)).item()
+                
+                grid, inverse_grid, mask = self.USR.init_grids(grid_w, grid_h, center_x, center_y, r1, r2, theta)
+
+                grid_tensor.append(grid.unsqueeze(dim=0))
+                inverse_grid_t.append(inverse_grid.unsqueeze(dim=0))
+                mask_fan_t.append(mask.unsqueeze(dim=0))
+
+            self.grid_t = torch.cat(grid_tensor).to(self.device)
+            self.inverse_grid_t = torch.cat(inverse_grid_t).to(self.device)
+            self.mask_fan_t = torch.cat(mask_fan_t).to(self.device)
+
+            # Save tensors directly to the current directory
+            
+            torch.save(self.grid_t, grid_t_file)
+            torch.save(self.inverse_grid_t, inverse_grid_t_file)
+            torch.save(self.mask_fan_t, mask_fan_t_file)
+
+            # print("Grids SAVED!")
+            # print(self.grid_t.shape, self.inverse_grid_t.shape, self.mask_fan_t.shape)
         
-        noise = torch.randn_like(images).to(self.device)
-        # Create timesteps
-        timesteps = torch.randint(0, self.inferer.scheduler.num_train_timesteps, (batch_size,)).to(self.device).long()
-        # Get model prediction
-        # cross attention expects shape [batch size, sequence length, channels], we are use channels = latent dimension and sequence length = 1
-        latent = self.semantic_encoder(images)
-        noise_pred = self.inferer(inputs=images, diffusion_model=self.unet, noise=noise, timesteps=timesteps, condition = latent.unsqueeze(2))
-        loss = F.mse_loss(noise_pred.float(), noise.float())
+        elif not hasattr(self, 'grid_t'):
+            # Load tensors directly from the current directory
+            self.grid_t = torch.load(grid_t_file).to(self.device)
+            self.inverse_grid_t = torch.load(inverse_grid_t_file).to(self.device)
+            self.mask_fan_t = torch.load(mask_fan_t_file).to(self.device)
+    
+    def compute_loss(self, Y, X_hat, step="train", sync_dist=False):
+        
+        loss = self.loss_fn(Y, X_hat) # The cosine similarity loss is close to 1 if the vectores are pointing in the same direction
 
-        self.log("loss", loss)
+        loss_mean = torch.mean(loss) # This should be close to 1
+        # loss_std = torch.std(loss) # This should be close to 0        
+        
+        loss = torch.sum(torch.square(1.0 - loss)) # We minimize 1 - cos_sim so the vector are as close as possible to each other
+        
+        self.log(f"{step}_loss", loss, sync_dist=sync_dist)
+        self.log(f"{step}_loss_mean", loss_mean, sync_dist=sync_dist)
+        # self.log(f"{step}_loss_std", loss_std, sync_dist=sync_dist)
 
         return loss
 
-    def validation_step(self, val_batch, batch_idx):
+    def volume_sampling(self, X, X_origin, X_end, use_random=False):
+        with torch.no_grad():
+            simulator = self.simu0
+            
+            grid = None
+            inverse_grid = None
+            mask_fan = None
 
-        images = val_batch
+            tags = self.vs.tags
 
-        batch_size = images.shape[0]
+            if use_random:
 
-        timesteps = torch.randint(0, self.inferer.scheduler.num_train_timesteps, (batch_size,)).to(self.device).long()
+                simulator_idx = np.random.choice([0, 1, 2, 3, 4], replace=False)
+                simulator = getattr(self, f'simu{simulator_idx}')
+                # simulator = self.simu0
 
-        noise = torch.randn_like(images).to(self.device)
-        latent = self.semantic_encoder(images)
-        noise_pred = self.inferer(inputs=images, diffusion_model=self.unet, noise=noise, timesteps=timesteps, condition = latent.unsqueeze(2))
-        loss = F.mse_loss(noise_pred.float(), noise.float())
+                if self.hparams.num_random_sweeps > 0:
+                    tags = np.random.choice(self.vs.tags, self.hparams.num_random_sweeps)
+                else:
+                    tags = self.vs.tags
 
-        self.log("val_loss", loss, sync_dist=True)
-        
+                grid_idx = torch.randint(low=0, high=self.hparams.n_grids - 1, size=(1,))
+            
+                grid = self.grid_t[grid_idx]
+                inverse_grid = self.inverse_grid_t[grid_idx]
+                mask_fan = self.mask_fan_t[grid_idx] 
+
+            X_sweeps = []
+            X_sweeps_tags = []            
+
+            for tag in tags:                
+                
+                sampled_sweep_simu = self.vs.get_sweep(X, X_origin, X_end, tag, use_random=use_random, simulator=simulator, grid=grid, inverse_grid=inverse_grid, mask_fan=mask_fan)
+                r_idx = torch.randint(low=0, high=sampled_sweep_simu.shape[3], size=(self.hparams.time_steps,))
+                r_idx = torch.sort(r_idx)[0]                
+                sampled_sweep_simu = sampled_sweep_simu[:, :, :, r_idx, :, :]                
+                X_sweeps.append(sampled_sweep_simu)
+                X_sweeps_tags.append(self.vs.tags_dict[tag])
+                
+            X_sweeps = torch.cat(X_sweeps, dim=1)
+            X_sweeps_tags = torch.tensor(X_sweeps_tags, device=self.device)
+
+            return X_sweeps, X_sweeps_tags
     
+    def compute_orthogonal_frame(self, pc: torch.Tensor) -> torch.Tensor:    
+        """
+        Given point clouds,
+        returns a tensor of shape [B, 3, 3] representing an orthogonal frame [x, y, z] for each batch.
+        """
 
+        head_idx = self.head_idx.expand(pc.shape[0], -1, -1)
+        belly_idx = self.belly_idx.expand(pc.shape[0], -1, -1)
+        side_idx = self.side_idx.expand(pc.shape[0], -1, -1)
+
+        pc_head_k = knn_gather(pc, head_idx).squeeze(2)
+        pc_belly_k = knn_gather(pc, belly_idx).squeeze(2)
+        pc_side_k = knn_gather(pc, side_idx).squeeze(2)
+
+        points = torch.stack([torch.mean(pc_belly_k, dim=1),
+                            torch.mean(pc_head_k, dim=1),
+                            torch.mean(pc_side_k, dim=1)], dim=1)
+
+        p0 = points[:, 0]
+        p1 = points[:, 1]
+        p2 = points[:, 2]
+        
+        v1 = p1 - p0
+        v2 = p2 - p0
+
+        # Normalize x (first direction)
+        x = F.normalize(v1, dim=1)
+
+        # Compute z = normalized cross(v1, v2)
+        z = F.normalize(torch.cross(v1, v2, dim=1), dim=1)
+
+        # Compute y = cross(z, x)
+        y = torch.cross(z, x, dim=1)
+
+        # Stack the vectors as rows of the rotation matrix
+        frame = torch.stack([x, y, z], dim=1)  # [B, 3, 3]
+
+        return frame, points
+
+    def training_step(self, train_batch, batch_idx):
+        X, X_origin, X_end, X_PC = train_batch
+
+        X, rotation_matrices = self.vs.random_rotate_3d_batch(X)
+
+        x_sweeps, sweeps_tags = self.volume_sampling(X, X_origin, X_end, use_random=True)
+
+        x_hat = self(x_sweeps, sweeps_tags)        
+
+        X_PC = self.vs.apply_batch_rotation(X_PC, rotation_matrices[:,0:3,0:3])
+        
+        y, y_p = self.compute_orthogonal_frame(X_PC)        
+
+        return self.compute_loss(Y=y, X_hat=x_hat, step="train")
+        
+
+    def validation_step(self, val_batch, batch_idx):
+        
+        X, X_origin, X_end, X_PC = val_batch
+
+        x_sweeps, sweeps_tags = self.volume_sampling(X, X_origin, X_end)
+
+        x_hat = self(x_sweeps, sweeps_tags)
+
+        y, y_p = self.compute_orthogonal_frame(X_PC)        
+
+        return self.compute_loss(Y=y, X_hat=x_hat, step="val", sync_dist=True)
+
+        
+
+    def encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        
+        """
+        Forwards an image through the spatial encoder, obtaining the latent mean and sigma representations.
+
+        Args:
+            x: BxCx[SPATIAL DIMS] tensor
+
+        """
+        z = []
+        for x_chunk in x.chunk(self.hparams.n_chunks_e, dim=2):
+            z.append(self.encoder(x_chunk))
+        z = torch.cat(z, dim=2)
+
+        return z
+
+    def forward(self, x_sweeps: torch.tensor, sweeps_tags: torch.tensor):
+        
+        batch_size = x_sweeps.shape[0]
+        # x_sweeps shape is B, N, C, T, H, W. N for number of sweeps ex. torch.Size([2, 2, 1, 200, 256, 256]) 
+        # tags shape torch.Size([2, 2])
+        Nsweeps = x_sweeps.shape[1] # Number of sweeps -> T
+
+        z = []
+        x_v = []
+
+        for n in range(Nsweeps):
+            x_sweeps_n = x_sweeps[:, n, :, :, :, :] # [BS, C, T, H, W]
+            
+            tag = sweeps_tags[n]
+            # x_sweeps_n = self.vs.embed_sweep(tag, x_sweeps_n)
+
+            z_ = self.encode(x_sweeps_n) # [BS, T, self.hparams.features]
+
+            # tag = sweeps_tags[n]
+            p_enc = self.p_encoding[tag].unsqueeze(0)
+
+            z_ = z_.permute(0, 2, 1) # Permute the time dim with the output features. -> Shape is now [BS, T, F]
+            z_ = z_ + p_enc # [BS, T, self.hparams.features]            
+            z_ = self.proj(z_) # [BS, self.hparams.n_chunks, self.hparams.embed_dim]
+
+            z_ = self.attn_chunk(z_) # [BS, self.hparams.n_chunks, self.hparams.features]
+            z_ = self.mha(z_)
+            
+            z.append(z_)
+
+        z = torch.stack(z, dim=1) # [BS, N, self.hparams.n_chunks, 64*64*self.hparams.latent_channels]
+        z = z.view(batch_size, -1, self.hparams.embed_dim).contiguous()
+
+        z, z_s = self.attn(z, z)
+
+        x_hat = self.proj_final(z)        
+        x_hat = x_hat.view(batch_size, 3, 3).contiguous() # [BS, 3, 3]
+        x_hat = F.normalize(x_hat, dim=2)
+
+        return x_hat
+
+    # Given diffusion model: model(x, t, cond)
+# x: noisy input at timestep t
+# cond: conditional information, cond=None is unconditional
+
+def guided_sampling(model, x_t, t, cond, guidance_scale):
+    # Predict noise conditioned on cond
+    eps_cond = model(x_t, t, cond)
+    
+    # Predict noise without conditioning (unconditional)
+    eps_uncond = model(x_t, t, cond=None)
+    
+    # Perform classifier-free guidance
+    eps_guided = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+    
+    return eps_guided
+
+
+class USSeg(LightningModule):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.vs = VolumeSamplingBlindSweep()
+
+        self.model = monai_nets.UNet(
+            spatial_dims=self.hparams.spatial_dims,
+            in_channels=self.hparams.in_channels,
+            out_channels=self.hparams.out_channels,
+            channels=(16, 32, 64, 128, 256),
+            strides=(2, 2, 2, 2),
+            num_res_units=2,
+            norm=self.hparams.norm,
+        )
+        self.loss_fn = DiceLoss(to_onehot_y=True, softmax=True)
+        # self.post_pred = Compose([EnsureType("tensor", device="cpu"), AsDiscrete(argmax=True, to_onehot=2)])
+        # self.post_label = Compose([EnsureType("tensor", device="cpu"), AsDiscrete(to_onehot=2)])
+        self.dice_metric = DiceMetric(include_background=False, reduction="mean", get_not_nans=False)
+
+        self.simu0 = TimeDistributed(us_simulation_jit.MergedLinearCutLabel11(), time_dim=2)
+        self.simu1 = TimeDistributed(us_simulation_jit.MergedCutLabel11(), time_dim=2)
+        self.simu2 = TimeDistributed(us_simulation_jit.MergedUSRLabel11(), time_dim=2)
+        self.simu3 = TimeDistributed(us_simulation_jit.MergedLinearLabel11(), time_dim=2)
+        self.simu4 = TimeDistributed(us_simulation_jit.MergedLinearLabel11WOG(), time_dim=2)
+    
+    @staticmethod
+    def add_model_specific_args(parent_parser):
+        group = parent_parser.add_argument_group("Calculate baby frame of orientation")
+
+        group.add_argument("--lr", type=float, default=1e-4)
+        group.add_argument('--weight_decay', help='Weight decay for optimizer', type=float, default=0.01)
+        
+        # Image Encoder parameters 
+        group.add_argument("--spatial_dims", type=int, default=3, help='Spatial dimensions for the encoder')
+        group.add_argument("--in_channels", type=int, default=1, help='Input number of channels')
+        group.add_argument("--out_channels", type=int, default=12, help='Output number of channels')
+        group.add_argument("--time_steps", type=int, default=128, help='Sample N number of frames from sweep')
+        group.add_argument("--norm", type=str, default='BATCH', help='Type of norm')
+        group.add_argument("--num_sweeps", type=int, default=1, help='Sample N sweeps from the volume')
+        group.add_argument("--n_grids", type=int, default=200, help='Number of grids')
+        
+        
+        # group.add_argument("--p_ids", type=int, nargs='+', default=[1470, 3369, 2043], help='Point ids to compute the orthogonal orientation frame')
+        # group.add_argument("--target_label", type=int, default=7, help='Target label')
+
+        # group.add_argument("--n_fixed_samples", type=int, default=12288, help='Number of fixed samples')
+
+        return parent_parser
+    
+    def configure_optimizers(self):
+        optimizer = optim.AdamW(self.parameters(),
+                                lr=self.hparams.lr,
+                                weight_decay=self.hparams.weight_decay)
+        return optimizer
+
+    def on_fit_start(self):
+
+        # Define the file names directly without using out_dir
+        grid_t_file = 'grid_t.pt'
+        inverse_grid_t_file = 'inverse_grid_t.pt'
+        mask_fan_t_file = 'mask_fan_t.pt'
+
+        if not os.path.exists(grid_t_file):
+            grid_tensor = []
+            inverse_grid_t = []
+            mask_fan_t = []
+
+            for i in range(self.hparams.n_grids):
+
+                grid_w, grid_h = self.hparams.grid_w, self.hparams.grid_h
+                center_x = self.hparams.center_x
+                r1 = self.hparams.r1
+
+                center_y = self.hparams.center_y_start + (self.hparams.center_y_end - self.hparams.center_y_start) * (torch.rand(1))
+                r2 = self.hparams.r2_start + ((self.hparams.r2_end - self.hparams.r2_start) * torch.rand(1)).item()
+                theta = self.hparams.theta_start + ((self.hparams.theta_end - self.hparams.theta_start) * torch.rand(1)).item()
+                
+                grid, inverse_grid, mask = self.USR.init_grids(grid_w, grid_h, center_x, center_y, r1, r2, theta)
+
+                grid_tensor.append(grid.unsqueeze(dim=0))
+                inverse_grid_t.append(inverse_grid.unsqueeze(dim=0))
+                mask_fan_t.append(mask.unsqueeze(dim=0))
+
+            self.grid_t = torch.cat(grid_tensor).to(self.device)
+            self.inverse_grid_t = torch.cat(inverse_grid_t).to(self.device)
+            self.mask_fan_t = torch.cat(mask_fan_t).to(self.device)
+
+            # Save tensors directly to the current directory
+            
+            torch.save(self.grid_t, grid_t_file)
+            torch.save(self.inverse_grid_t, inverse_grid_t_file)
+            torch.save(self.mask_fan_t, mask_fan_t_file)
+
+            # print("Grids SAVED!")
+            # print(self.grid_t.shape, self.inverse_grid_t.shape, self.mask_fan_t.shape)
+        
+        elif not hasattr(self, 'grid_t'):
+            # Load tensors directly from the current directory
+            self.grid_t = torch.load(grid_t_file).to(self.device)
+            self.inverse_grid_t = torch.load(inverse_grid_t_file).to(self.device)
+            self.mask_fan_t = torch.load(mask_fan_t_file).to(self.device)
+    
+    def compute_loss(self, Y, X_hat, step="train", sync_dist=False):
+        
+        loss = self.loss_fn(X_hat, Y) 
+        
+        self.log(f"{step}_loss", loss, sync_dist=sync_dist)
+        # self.log(f"{step}_loss_mean", loss_mean, sync_dist=sync_dist)
+        # self.log(f"{step}_loss_std", loss_std, sync_dist=sync_dist)
+
+        return loss
+
+    def volume_sampling(self, X, X_origin, X_end, use_random=False):
+        with torch.no_grad():
+            simulator = self.simu0
+            
+            grid = None
+            inverse_grid = None
+            mask_fan = None
+
+            tags = self.vs.tags
+
+            if use_random:
+
+                simulator_idx = np.random.choice([0, 1, 2, 3, 4], replace=False)
+                simulator = getattr(self, f'simu{simulator_idx}')
+
+                grid_idx = torch.randint(low=0, high=self.hparams.n_grids - 1, size=(1,))
+            
+                grid = self.grid_t[grid_idx]
+                inverse_grid = self.inverse_grid_t[grid_idx]
+                mask_fan = self.mask_fan_t[grid_idx] 
+
+            
+            tags = np.random.choice(self.vs.tags, self.hparams.num_sweeps)
+                
+
+            X_sweeps = []
+            Y_sweeps = []
+            X_sweeps_tags = []            
+
+            for tag in tags:                
+                
+                sampled_sweep_simu, sampled_sweep = self.vs.get_sweep(X, X_origin, X_end, tag, use_random=use_random, simulator=simulator, grid=grid, inverse_grid=inverse_grid, mask_fan=mask_fan, return_masked=True)
+                
+                r_idx = torch.randint(low=0, high=sampled_sweep_simu.shape[3], size=(self.hparams.time_steps,))
+                r_idx = torch.sort(r_idx)[0]
+                sampled_sweep_simu = sampled_sweep_simu[:, :, :, r_idx, :, :]
+                sampled_sweep = sampled_sweep[:, :, r_idx, :, :]        
+                X_sweeps.append(sampled_sweep_simu)
+                X_sweeps_tags.append(self.vs.tags_dict[tag])
+
+                Y_sweeps.append(sampled_sweep)
+                
+            X_sweeps = torch.cat(X_sweeps, dim=1)
+            X_sweeps_tags = torch.tensor(X_sweeps_tags, device=self.device)
+            Y_sweeps = torch.cat(Y_sweeps, dim=1)
+
+            return X_sweeps, Y_sweeps, X_sweeps_tags
+
+    def training_step(self, train_batch, batch_idx):
+        X, X_origin, X_end, X_PC = train_batch
+
+        X, rotation_matrices = self.vs.random_rotate_3d_batch(X)
+
+        x, y, sweeps_tags = self.volume_sampling(X, X_origin, X_end, use_random=True)
+        x = x.squeeze(1)
+
+        x_hat = self(x)
+
+        return self.compute_loss(Y=y, X_hat=x_hat, step="train")
+        
+
+    def validation_step(self, val_batch, batch_idx):
+        
+        X, X_origin, X_end, X_PC = val_batch
+
+        x, y, sweeps_tags = self.volume_sampling(X, X_origin, X_end)
+        x = x.squeeze(1)
+
+        x_hat = self(x)
+
+        self.dice_metric(y=y, y_pred=x_hat)
+
+        return self.compute_loss(Y=y, X_hat=x_hat, step="val", sync_dist=True)
+
+    def on_validation_epoch_end(self):
+        # aggregate the final mean dice result
+        metric = self.dice_metric.aggregate().item()
+
+        self.log("val_dice", metric, sync_dist=True)
+        
+        self.dice_metric.reset()
+
+    def forward(self, x_sweeps: torch.tensor):
+        return self.model(x_sweeps)

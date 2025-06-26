@@ -60,10 +60,7 @@ from pytorch3d.ops import (sample_points_from_meshes,
 import sys
 sys.path.append('/mnt/raid/C1_ML_Analysis/source/ShapeAXI/src/')
 
-from shapeaxi.saxi_nets import MHAEncoder_V, MHAIdxEncoder, MHAIdxDecoder
 from shapeaxi.saxi_layers import AttentionChunk, SelfAttention, MHAContextModulated, ProjectionHead
-
-from torch.nn.utils.rnn import pad_sequence
 
 from positional_encodings.torch_encodings import PositionalEncoding2D
 
